@@ -36,10 +36,11 @@ $ToolLog = Join-Path $env:TEMP "pes-tools-install.log" # 설치기 출력(실패
 function Run-Remote($urls, $argList) {
   $f = Join-Path $env:TEMP "pes-tool-$(Get-Random).ps1"
   $ok = $false
-  foreach ($u in $urls) { try { Invoke-WebRequest $u -OutFile $f -UseBasicParsing; $ok = $true; break } catch { } }
-  if (-not $ok) { Add-Content $ToolLog "받지 못함: $($urls -join ' · ')"; return $false }
-  Add-Content $ToolLog "== $($urls[0])"
-  & $PsExe -NoProfile -ExecutionPolicy Bypass -File $f @argList *>> $ToolLog
+  # Windows PowerShell 5 는 BOM 없는 UTF-8 스크립트를 ANSI 로 읽어 한글이 깨진다 — 글로 받아 BOM 을 붙여 쓴다
+  foreach ($u in $urls) { try { $wc = New-Object Net.WebClient; $wc.Encoding = [Text.Encoding]::UTF8; [IO.File]::WriteAllText($f, $wc.DownloadString($u), (New-Object Text.UTF8Encoding($true))); $ok = $true; break } catch { } }
+  if (-not $ok) { "받지 못함: $($urls -join ' · ')" | Out-File $ToolLog -Append -Encoding utf8; return $false }
+  "== $($urls[0])" | Out-File $ToolLog -Append -Encoding utf8
+  & $PsExe -NoProfile -ExecutionPolicy Bypass -File $f @argList *>&1 | Out-File $ToolLog -Append -Encoding utf8
   Remove-Item $f -ErrorAction SilentlyContinue
   return $true
 }
@@ -82,7 +83,7 @@ function Cmd-Install {
     Write-Output "... $t 설치 중"
     Install-One $t
     if (Have $t) { Write-Output "INSTALLED $t" } else {
-      $tail = if (Test-Path $ToolLog) { ((Get-Content $ToolLog -Tail 3) -join ' / ') } else { "" }
+      $tail = if (Test-Path $ToolLog) { ((Get-Content $ToolLog -Tail 3 -Encoding UTF8) -join ' / ') } else { "" }
       Write-Output "FAIL $t 설치하지 못했어요 — $tail (전체: $ToolLog)"
     }
   }

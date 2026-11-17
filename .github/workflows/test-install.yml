@@ -27,7 +27,7 @@ jobs:
       - name: 설치기 기록
         if: always()
         shell: powershell
-        run: if (Test-Path "$env:TEMP\pes-tools-install.log") { Get-Content "$env:TEMP\pes-tools-install.log" -Tail 80 }
+        run: if (Test-Path "$env:TEMP\pes-tools-install.log") { Get-Content "$env:TEMP\pes-tools-install.log" -Tail 80 -Encoding UTF8 }
       - name: 확인
         shell: powershell
         run: |
