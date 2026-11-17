@@ -22,7 +22,7 @@ $Raw = "https://raw.githubusercontent.com/clazic"
 function Refresh-Path {
   $m = [Environment]::GetEnvironmentVariable("Path", "Machine")
   $u = [Environment]::GetEnvironmentVariable("Path", "User")
-  $extra = @("$env:USERPROFILE\.local\bin", "$env:APPDATA\npm", "$L\Programs\kosis", "$L\Programs\sgis", "$L\vworld", "C:\Program Files\nodejs", "C:\Program Files\Git\cmd")
+  $extra = @("$env:USERPROFILE\.local\bin", "$env:USERPROFILE\.pes\runtime\node", "$env:APPDATA\npm", "$L\Programs\kosis", "$L\Programs\sgis", "$L\vworld", "C:\Program Files\nodejs", "C:\Program Files\Git\cmd")
   $env:Path = (@($extra) + @("$m", "$u")) -join ";"
 }
 Refresh-Path

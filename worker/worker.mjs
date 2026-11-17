@@ -38,7 +38,7 @@ const SEP = WIN ? ';' : ':'
 const RT = join(homedir(), '.pes', 'runtime')
 const LAD = process.env.LOCALAPPDATA || join(homedir(), 'AppData', 'Local')
 const FIRST = WIN
-  ? [join(homedir(), '.local', 'bin'), join(process.env.APPDATA || join(homedir(), 'AppData', 'Roaming'), 'npm'), join(LAD, 'Programs', 'kosis'), join(LAD, 'Programs', 'sgis'), join(LAD, 'vworld'), 'C:\\Program Files\\nodejs', 'C:\\Program Files\\Git\\cmd']
+  ? [join(homedir(), '.local', 'bin'), join(RT, 'node'), join(process.env.APPDATA || join(homedir(), 'AppData', 'Roaming'), 'npm'), join(LAD, 'Programs', 'kosis'), join(LAD, 'Programs', 'sgis'), join(LAD, 'vworld'), 'C:\\Program Files\\nodejs', 'C:\\Program Files\\Git\\cmd']
   : [join(RT, 'bin'), join(RT, 'node', 'bin'), join(homedir(), '.local', 'bin'), '/opt/homebrew/bin', '/usr/local/bin']
 process.env.PATH = [...FIRST, process.env.PATH || (WIN ? '' : '/usr/bin:/bin')].join(SEP)
 const EXTS = WIN ? ['.exe', '.cmd', '.bat', ''] : ['']

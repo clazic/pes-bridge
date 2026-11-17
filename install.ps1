@@ -28,7 +28,7 @@ function Stop-Install { if ($PSCommandPath) { exit 1 } }  # irm | iex 로 돌면
 function Refresh-Path {
   $m = [Environment]::GetEnvironmentVariable("Path", "Machine")
   $u = [Environment]::GetEnvironmentVariable("Path", "User")
-  $env:Path = "$env:USERPROFILE\.local\bin;$env:APPDATA\npm;C:\Program Files\nodejs;C:\Program Files\Git\cmd;$m;$u"
+  $env:Path = "$env:USERPROFILE\.local\bin;$env:USERPROFILE\.pes\runtime\node;$env:APPDATA\npm;C:\Program Files\nodejs;C:\Program Files\Git\cmd;$m;$u"
 }
 function Show($line) {
   if ($line -like "OK *" -or $line -like "INSTALLED *") { Ok $line } elseif ($line -like "FAIL *" -or $line -like "MISSING *") { Fail $line } elseif ($line -like "USER *") { Warn $line } elseif ($line -like "KEY *") { Warn $line } else { Write-Host "  $line" }
@@ -60,8 +60,31 @@ $nodeCmd = $null
   $l = "$_"; if ($l -like "NODE *") { $nodeCmd = $l.Substring(5).Trim() } else { Show $l }
 }
 Refresh-Path
+# winget 이 없거나 실패하면 nodejs.org 공식 zip 을 받아 %USERPROFILE%\.pes\runtime\node 에 둔다(관리자 권한 없이 · SHA-256 확인)
+function Node-Ok { $v = & node --version 2>$null; return ($v -match '^v(\d+)\.' -and [int]$Matches[1] -ge 26) }
+if (-not (Node-Ok)) {
+  $ar = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "x64" }
+  $D = "https://nodejs.org/dist/latest-v26.x"
+  try {
+    $sums = (Invoke-WebRequest "$D/SHASUMS256.txt" -UseBasicParsing).Content -split "`n"
+    $line = $sums | Where-Object { $_ -match "node-v[\d.]+-win-$ar\.zip$" } | Select-Object -First 1
+    $sha, $file = ($line.Trim() -split '\s+')
+    $zip = Join-Path $env:TEMP $file
+    Invoke-WebRequest "$D/$file" -OutFile $zip -UseBasicParsing
+    if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLower() -ne $sha.ToLower()) { throw "SHA-256 이 맞지 않아요" }
+    $rt = Join-Path $env:USERPROFILE ".pes\runtime"; New-Item -ItemType Directory -Force -Path $rt | Out-Null
+    Remove-Item (Join-Path $rt "node") -Recurse -Force -ErrorAction SilentlyContinue
+    Expand-Archive $zip -DestinationPath $rt -Force
+    Rename-Item (Join-Path $rt ($file -replace '\.zip$', '')) "node"
+    Remove-Item $zip -ErrorAction SilentlyContinue
+    $u = [Environment]::GetEnvironmentVariable("Path", "User"); $nd = Join-Path $rt "node"
+    if ($u -notlike "*$nd*") { [Environment]::SetEnvironmentVariable("Path", "$nd;$u", "User") }  # 새 창 · npm 전역 도구가 찾게
+    Refresh-Path
+    if (Node-Ok) { Ok "INSTALLED node $(& node --version) ($nd)" }
+  } catch { Fail "Node.js 를 받지 못했어요: $($_.Exception.Message)" }
+}
 $Node = (Get-Command node -ErrorAction SilentlyContinue | Select-Object -First 1).Source
-if (-not $Node -or $nodeCmd -eq "none") { Fail "Node.js 26 이상이 필요해요 — https://nodejs.org 에서 설치한 뒤 새 PowerShell 창에서 다시 실행해 주세요"; Stop-Install; return }
+if (-not $Node -or -not (Node-Ok)) { Fail "Node.js 26 이상이 필요해요 — https://nodejs.org 에서 설치한 뒤 새 PowerShell 창에서 다시 실행해 주세요"; Stop-Install; return }
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) { Warn "Git 이 없어요 — Claude Code 가 Git Bash 를 써요. https://git-scm.com/download/win 에서 설치해 주세요" }
 
 Step 3 "Claude Code"
