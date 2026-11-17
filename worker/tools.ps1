@@ -30,14 +30,16 @@ function Have($n) { [bool](Get-Command $n -ErrorAction SilentlyContinue) }
 function Where-Is($n) { $c = Get-Command $n -ErrorAction SilentlyContinue | Select-Object -First 1; if ($c) { $c.Source } else { "" } }
 function Mask($k) { if ($k.Length -gt 8) { $k.Substring(0, 4) + "…" + $k.Substring($k.Length - 4) } else { "****" } }
 $PsExe = (Get-Process -Id $PID).Path
+$ToolLog = Join-Path $env:TEMP "pes-tools-install.log" # 설치기 출력(실패하면 마지막 줄을 함께 보인다)
 
 # 각 도구의 설치 스크립트를 파일로 받아 따로 돌린다(그 스크립트가 exit 해도 이 스크립트는 계속)
 function Run-Remote($urls, $argList) {
   $f = Join-Path $env:TEMP "pes-tool-$(Get-Random).ps1"
   $ok = $false
   foreach ($u in $urls) { try { Invoke-WebRequest $u -OutFile $f -UseBasicParsing; $ok = $true; break } catch { } }
-  if (-not $ok) { return $false }
-  & $PsExe -NoProfile -ExecutionPolicy Bypass -File $f @argList *> $null
+  if (-not $ok) { Add-Content $ToolLog "받지 못함: $($urls -join ' · ')"; return $false }
+  Add-Content $ToolLog "== $($urls[0])"
+  & $PsExe -NoProfile -ExecutionPolicy Bypass -File $f @argList *>> $ToolLog
   Remove-Item $f -ErrorAction SilentlyContinue
   return $true
 }
@@ -79,7 +81,10 @@ function Cmd-Install {
     if (Have $t) { Write-Output "OK $t $(Where-Is $t)"; continue }
     Write-Output "... $t 설치 중"
     Install-One $t
-    if (Have $t) { Write-Output "INSTALLED $t" } else { Write-Output "FAIL $t 설치하지 못했어요" }
+    if (Have $t) { Write-Output "INSTALLED $t" } else {
+      $tail = if (Test-Path $ToolLog) { ((Get-Content $ToolLog -Tail 3) -join ' / ') } else { "" }
+      Write-Output "FAIL $t 설치하지 못했어요 — $tail (전체: $ToolLog)"
+    }
   }
 }
 function Cmd-Check {

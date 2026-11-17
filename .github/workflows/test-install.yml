@@ -24,6 +24,10 @@ jobs:
         shell: powershell
         env: { PES_WORKER_TEST: "1", PES_WORKER_SRC: "${{ github.workspace }}" }
         run: .\install.ps1
+      - name: 설치기 기록
+        if: always()
+        shell: powershell
+        run: if (Test-Path "$env:TEMP\pes-tools-install.log") { Get-Content "$env:TEMP\pes-tools-install.log" -Tail 80 }
       - name: 확인
         shell: powershell
         run: |
