@@ -1,0 +1,29 @@
+# clazic/pes 의 scripts/ 가 바뀌면 이 저장소의 pes-scripts/ 에 그대로 옮긴다.
+# 30분마다 확인하고, Actions 화면에서 바로 돌릴 수도 있다(workflow_dispatch).
+# clazic/pes 쪽에서 바로 알리려면 repository_dispatch(event_type: pes-scripts-changed)를 보내면 된다.
+name: sync pes-scripts
+on:
+  schedule: [{ cron: "*/30 * * * *" }]
+  workflow_dispatch:
+  repository_dispatch: { types: [pes-scripts-changed] }
+permissions: { contents: write }
+concurrency: { group: sync-pes-scripts, cancel-in-progress: false }
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: clazic/pes scripts 받기
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/clazic/pes.git /tmp/pes
+          git -C /tmp/pes sparse-checkout set scripts
+          echo "SRC_SHA=$(git -C /tmp/pes rev-parse --short HEAD)" >> "$GITHUB_ENV"
+      - name: pes-scripts/ 에 맞추기
+        run: rsync -a --delete --exclude node_modules /tmp/pes/scripts/ pes-scripts/
+      - name: 바뀐 것이 있으면 커밋
+        run: |
+          git add -A pes-scripts
+          if git diff --cached --quiet; then echo "바뀐 것 없음"; exit 0; fi
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -m "sync: clazic/pes scripts @ ${SRC_SHA}"
+          git push

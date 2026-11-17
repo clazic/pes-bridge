@@ -1,0 +1,2854 @@
+// Thin Node side of scripts/pes.py's DB write path (stage 2 PR15).
+//
+// scripts/pes.py never imports TypeScript. With PES_DB_CORE=1 it runs this file
+// once per CLI call: one JSON request on stdin, one JSON reply on stdout.
+//
+//   request : { op, slug?, session?, token?, args? }
+//   reply   : { ok: true, data } | { ok: false, code, message, exit }
+//
+// Every business write goes through CommandService (the public wrappers in
+// content.ts, editions.ts, files.ts, questions.ts, records.ts, runs.ts, results.ts);
+// this file holds no business SQL. The few SELECTs below only look things up
+// (project by slug, stage by key, the open round, the live lease, current
+// versions for a manifest) — they never write.
+//
+// Credentials (stage-2 decision, tests/test_cli_write.test.ts):
+//   no token  -> the human owner of the project in this computer's database
+//   token     -> that agent actor, after verify_agent_token + the needed scope
+//   session   -> PES_OWNER, only a lock label; it is never a credential.
+
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
+
+import { resolve_actor, verify_agent_token } from "./actors.ts";
+import { ApiApp } from "./api.ts";
+import { SystemClock } from "./clock.ts";
+import {
+  CommandService,
+  type CommandOutcome,
+  type MutationContext,
+} from "./commands.ts";
+import {
+  add_artifact,
+  add_citation,
+  add_source,
+  append_version,
+  create_object,
+  import_library,
+  link_relation,
+  set_current,
+  submit_results,
+} from "./content.ts";
+import { connect, connect_read_only, load_migrations, migrate, probe_database, type Db } from "./db.ts";
+import { approve_stage, reopen_stage, seal_round, start_round } from "./editions.ts";
+import { current_place } from "./commands/api_reads.ts";
+import { UnitOfWorkDb } from "./commands/unit.ts";
+import { ApiError } from "./errors.ts";
+import { FORM_REVISED } from "./commands/records.ts";
+import { attach_version, complete_upload, delete_storage_file, read_storage_bytes, reserve_upload, store_blob, sha256_hex, write_storage_bytes } from "./files.ts";
+import { import_project } from "./legacy.ts";
+import { activate_import, assert_backup_location, serving_path, validate_import } from "./migration.ts";
+import { IMPLICIT_MANIFEST, build_project_view, build_snapshots, not_a_report_sql, output_names, rendered_files } from "./legacy_view.ts";
+import { db_path, objects_dir, pes_dir, type Environment } from "./paths.ts";
+import { ai_policy_state, DbPolicyChecker } from "./policy.ts";
+import { publish_set } from "./questions.ts";
+import {
+  add_note,
+  mark_processed,
+  prepare_question_draft,
+  record_chat,
+  record_qa,
+  record_qa_brief,
+} from "./records.ts";
+import { assemble_manuscript, final_report_html, local_stamp, REPORT_NAME, stage_report, type Dict } from "./report.ts";
+import { claim, complete, heartbeat, interrupt, wait } from "./runs.ts";
+
+interface Request {
+  op: string;
+  slug?: string;
+  session?: string;
+  token?: string;
+  args?: Record<string, unknown>;
+}
+
+class Refusal extends Error {
+  readonly code: string;
+  readonly exit: number;
+  constructor(code: string, message: string, exit = 1) {
+    super(message);
+    this.code = code;
+    this.exit = exit;
+  }
+}
+
+/** The old CLI's 2-hour session lock, now the run lease's lifetime. */
+const LOCK_LEASE_MS = 2 * 60 * 60 * 1000;
+const LOCK_HEARTBEAT_MS = 30 * 60 * 1000;
+/** runs.external_session_ref limit enforced by run.claim. */
+const SESSION_MAX = 200;
+const SLUG = /^[a-z0-9][a-z0-9-]{0,63}$/;
+/** The Korean stage names a person reads in a refusal (the same words as scripts/pes_core/cli_support.ts LABEL). */
+const STAGE_LABEL: Readonly<Record<string, string>> = { plan: "기획", research: "조사", analyze: "분석·종합", write: "집필", verify: "검증", publish: "산출·공유" };
+const STAGE_KEYS = ["plan", "research", "analyze", "write", "verify", "publish"];
+const VERIFIED_METHODS = new Set(["browser", "kosis", "law", "vworld"]);
+const SOURCE_METHODS = new Set(["search", "fetch", "browser", "kosis", "law", "vworld", "import", "unknown"]);
+const ARTIFACT_KINDS = new Set([
+  "rq", "chapter", "topic", "issue", "table", "section", "claim", "report", "review", "note",
+  "schedule", "insight", "output",
+]);
+const ARTIFACT_STATUSES = new Set([
+  "new", "deepen", "revise", "browser", "done", "removed", "failed", "draft", "published", "archived",
+]);
+
+interface ProjectInfo {
+  id: string;
+  slug: string;
+  topic: string;
+  owner_user_id: string;
+  active_edition_id: string | null;
+  status: string;
+}
+
+interface Auth {
+  actor_id: string;
+  kind: string;
+  scopes: string[] | null;
+}
+
+interface StageInfo {
+  id: string;
+  key: string;
+  ordinal: number;
+  status: string;
+  current_round_id: string | null;
+  edition_id: string;
+}
+
+interface LeaseInfo {
+  lease_id: string;
+  run_id: string;
+  owner_actor_id: string;
+  fence: number;
+  heartbeat_at: number;
+  acquired_at: number;
+  expires_at: number;
+  session: string | null;
+}
+
+function is_record(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function text_arg(args: Record<string, unknown>, field: string): string {
+  const value = args[field];
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Refusal("invalid_payload", `${field} 값이 필요합니다`, 2);
+  }
+  return value;
+}
+
+class Session {
+  readonly env: Environment;
+  readonly db: UnitOfWorkDb;
+  readonly clock = new SystemClock();
+  readonly service: CommandService;
+  readonly objects: string;
+  /** The project folder the caller named (scripts/pes.ts passes it): the messages that tell a person what to type use it, as 0.15 did. */
+  dir_label: string | undefined;
+  /** Object files this run wrote; they are removed again when the run fails (the rows roll back). */
+  readonly fresh_files: Array<{ project_id: string; storage_key: string }> = [];
+
+  /** `writable` false: a read-only command — the objects folder is not created (nothing on disk changes). */
+  constructor(env: Environment, db: Db, writable = true) {
+    this.env = env;
+    this.db = new UnitOfWorkDb(db);
+    this.objects = objects_dir(env);
+    if (writable) mkdirSync(this.objects, { recursive: true });
+    this.service = new CommandService(this.db, {
+      clock: this.clock,
+      policy: new DbPolicyChecker(),
+      objects_dir: this.objects,
+      run_config: { lease_ttl_ms: LOCK_LEASE_MS, heartbeat_interval_ms: LOCK_HEARTBEAT_MS },
+    });
+  }
+
+  now(): number {
+    return this.clock.now_ms();
+  }
+
+  /** After a failed run: delete the object files it wrote unless a committed blob row now claims them. */
+  discard_fresh_files(): void {
+    for (const file of this.fresh_files) {
+      const claimed = this.db.get("SELECT 1 AS ok FROM blobs WHERE storage_key = ?", file.storage_key);
+      if (claimed === undefined) delete_storage_file(this.objects, file.project_id, file.storage_key);
+    }
+    this.fresh_files.length = 0;
+  }
+
+  unit<T>(fn: () => Promise<T>): Promise<T> {
+    return this.db.unit(fn);
+  }
+
+  ctx(project: ProjectInfo | null, auth: Auth | null, base?: number): MutationContext {
+    const ctx: MutationContext = {
+      project_id: project === null ? null : project.id,
+      actor_id: auth === null ? null : auth.actor_id,
+      via: "cli",
+      client_request_id: `cli-${randomUUID()}`,
+    };
+    if (base !== undefined) ctx.base_control_rev = base;
+    return ctx;
+  }
+
+  project(slug: unknown): ProjectInfo {
+    if (typeof slug !== "string" || slug.length === 0) {
+      throw new Refusal("invalid_payload", "프로젝트 이름이 필요합니다", 2);
+    }
+    const row = this.db.get<ProjectInfo>(
+      "SELECT id, slug, topic, owner_user_id, active_edition_id, status FROM projects WHERE slug = ?",
+      slug,
+    );
+    if (row === undefined) {
+      throw new Refusal(
+        "not_found",
+        `DB에 없는 프로젝트입니다: ${slug} — 옛 project.json 프로젝트는 이전하기 전에는 쓸 수 없습니다`,
+      );
+    }
+    return { ...row };
+  }
+
+  /** No token: the project's human owner. Token: that agent, with the needed scope. */
+  auth(project: ProjectInfo, token: string | undefined, scope: string | null): Auth {
+    if (token === undefined || token.length === 0) {
+      const row = this.db.get<{ actor_id: string }>(
+        `SELECT a.id AS actor_id
+           FROM actors a
+           JOIN project_members m ON m.user_id = a.user_id
+           JOIN users u ON u.id = a.user_id
+          WHERE m.project_id = ? AND m.role = 'owner' AND a.kind = 'human'
+            AND a.disabled_at IS NULL AND u.disabled_at IS NULL
+          ORDER BY a.id LIMIT 1`,
+        project.id,
+      );
+      if (row === undefined) {
+        throw new Refusal("unauthenticated", "이 프로젝트의 사람 소유자를 찾을 수 없습니다");
+      }
+      return { actor_id: row.actor_id, kind: "human", scopes: null };
+    }
+    let scopes: string[];
+    let actor_id: string;
+    try {
+      const verified = verify_agent_token(this.db, token, { project_id: project.id, now_ms: this.now() });
+      scopes = verified.scopes;
+      actor_id = verified.actor_id;
+    } catch {
+      throw new Refusal("unauthenticated", "PES_TOKEN 이 올바르지 않습니다");
+    }
+    let kind: string;
+    try {
+      const resolved = resolve_actor(this.db, { project_id: project.id, actor_id }, this.now());
+      kind = resolved.kind;
+      actor_id = resolved.actor_id;
+    } catch {
+      throw new Refusal("forbidden", "이 토큰의 에이전트는 프로젝트 구성원이 아닙니다");
+    }
+    if (scope !== null && !scopes.includes(scope)) {
+      throw new Refusal("forbidden", `토큰에 ${scope} 권한이 없습니다`);
+    }
+    return { actor_id, kind, scopes };
+  }
+
+  stage(project: ProjectInfo, key: unknown): StageInfo {
+    if (project.active_edition_id === null) {
+      throw new Refusal("conflict", "프로젝트에 활성 판이 없습니다");
+    }
+    let stage_key = key;
+    if (stage_key === undefined || stage_key === null) {
+      const row = this.db.get<{ key: string }>(
+        `SELECT s.key AS key FROM editions e JOIN stages s
+            ON s.project_id = e.project_id AND s.id = e.current_stage_id
+          WHERE e.project_id = ? AND e.id = ?`,
+        project.id,
+        project.active_edition_id,
+      );
+      stage_key = row?.key;
+    }
+    if (typeof stage_key !== "string" || !STAGE_KEYS.includes(stage_key)) {
+      throw new Refusal("invalid_payload", `단계 이름은 ${STAGE_KEYS.join(", ")} 중 하나`, 2);
+    }
+    const row = this.db.get<{
+      id: string;
+      key: string;
+      ordinal: bigint;
+      status: string;
+      current_round_id: string | null;
+      edition_id: string;
+    }>(
+      `SELECT id, key, ordinal, status, current_round_id, edition_id
+         FROM stages WHERE project_id = ? AND edition_id = ? AND key = ?`,
+      project.id,
+      project.active_edition_id,
+      stage_key,
+    );
+    if (row === undefined) throw new Refusal("not_found", "단계를 찾을 수 없습니다");
+    return { ...row, ordinal: Number(row.ordinal) };
+  }
+
+  lease(project: ProjectInfo): LeaseInfo | null {
+    const row = this.db.get<{
+      lease_id: string;
+      run_id: string | null;
+      owner_actor_id: string | null;
+      fence: bigint;
+      heartbeat_at: bigint;
+      acquired_at: bigint;
+      expires_at: bigint;
+      state: string;
+    }>(
+      `SELECT lease_id, run_id, owner_actor_id, fence, heartbeat_at, acquired_at, expires_at, state
+         FROM project_leases WHERE project_id = ?`,
+      project.id,
+    );
+    if (
+      row === undefined ||
+      row.state !== "active" ||
+      row.run_id === null ||
+      row.owner_actor_id === null ||
+      this.now() >= Number(row.expires_at)
+    ) {
+      return null;
+    }
+    const run = this.db.get<{ external_session_ref: string | null }>(
+      "SELECT external_session_ref FROM runs WHERE project_id = ? AND id = ?",
+      project.id,
+      row.run_id,
+    );
+    return {
+      lease_id: row.lease_id,
+      run_id: row.run_id,
+      owner_actor_id: row.owner_actor_id,
+      fence: Number(row.fence),
+      heartbeat_at: Number(row.heartbeat_at),
+      acquired_at: Number(row.acquired_at),
+      expires_at: Number(row.expires_at),
+      session: run?.external_session_ref ?? null,
+    };
+  }
+
+  /** The lease belongs to this caller: same session label, or (no label) the same actor. */
+  is_mine(lease: LeaseInfo, auth: Auth, session: string | undefined): boolean {
+    if (session !== undefined && session.length > 0) return lease.session === session;
+    return lease.session === null && lease.owner_actor_id === auth.actor_id;
+  }
+
+  /** The old CLI's implicit lock: a write under PES_OWNER takes the lease when nobody holds it. */
+  async take_lock(project: ProjectInfo, auth: Auth, session: string): Promise<Record<string, unknown>> {
+    return result_of(
+      await claim(this.service, this.ctx(project, auth), {
+        mode: "B",
+        runtime: "pes-cli",
+        provider: "local",
+        model: "session-lock",
+        external_session_ref: session,
+      }),
+    );
+  }
+
+  /**
+   * Every content write passes through here.
+   *  - A token agent (kind other than human) writes only while it owns the live
+   *    lease; the returned guard (run, lease, fence) goes into the payload of the
+   *    commands whose service-side check demands it. No lease is never created for it.
+   *  - A human owner needs no lease. With PES_OWNER set the write takes the lease
+   *    when nobody holds it (v0.15's implicit lock) and keeps it alive; another
+   *    session's live lease refuses the write (exit 3).
+   */
+  async lock_check(project: ProjectInfo, auth: Auth, session: string | undefined): Promise<Record<string, unknown>> {
+    const lease = this.lease(project);
+    const labelled = session !== undefined && session.length > 0;
+    if (auth.kind !== "human") {
+      if (lease === null) {
+        throw new Refusal("forbidden", "이 에이전트에게는 이 프로젝트의 잠금(lease)이 없습니다 — claim 먼저 하세요");
+      }
+      if (lease.owner_actor_id !== auth.actor_id) this.refuse_locked(project, lease);
+      return { run_id: lease.run_id, lease_id: lease.lease_id, fence: lease.fence };
+    }
+    if (lease === null) {
+      if (labelled) await this.take_lock(project, auth, session);
+      return {};
+    }
+    if (!this.is_mine(lease, auth, session)) this.refuse_locked(project, lease);
+    if (labelled && this.now() - lease.heartbeat_at > LOCK_HEARTBEAT_MS) {
+      await heartbeat(this.service, this.ctx(project, auth), {
+        run_id: lease.run_id,
+        lease_id: lease.lease_id,
+        fence: lease.fence,
+      });
+    }
+    return {};
+  }
+
+  refuse_locked(project: ProjectInfo, lease: LeaseInfo): never {
+    const minutes = Math.max(0, Math.floor((this.now() - lease.heartbeat_at) / 60_000));
+    throw new Refusal(
+      "locked",
+      `다른 세션이 이 프로젝트를 쓰고 있습니다 (세션 ${Array.from(lease.session ?? "에이전트 run").slice(0, 8).join("")}…, ${local_stamp(lease.acquired_at)}부터, ` +
+        `마지막 기록 ${minutes}분 전). 그 세션을 닫았다면 \`lock ${this.dir_label ?? project.slug} --force\`로 가져오세요.`,
+      3,
+    );
+  }
+}
+
+function result_of(out: CommandOutcome): Record<string, unknown> {
+  return is_record(out.result) ? out.result : {};
+}
+
+function normalize_run_result(result: Record<string, unknown>): Record<string, unknown> {
+  const out = { ...result };
+  if (typeof out.fence === "number") out.fence = String(out.fence);
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// op handlers
+
+type Handler = (s: Session, req: Request) => Promise<unknown>;
+
+const WRITE_SCOPE = "run:submit";
+
+async function write_auth(
+  s: Session,
+  req: Request,
+): Promise<{ project: ProjectInfo; auth: Auth; guard: Record<string, unknown> }> {
+  const project = s.project(req.slug);
+  // A project that is not active yet (still being migrated) is served from project.json: no writes here.
+  if (project.status !== "active") {
+    throw new Refusal(
+      "conflict",
+      `이전이 끝나지 않은 프로젝트입니다: ${project.slug} — 옛 project.json 프로젝트는 이전을 마쳐 활성화하기 전에는 쓸 수 없습니다`,
+    );
+  }
+  const auth = s.auth(project, req.token, WRITE_SCOPE);
+  const guard = await s.lock_check(project, auth, req.session);
+  return { project, auth, guard };
+}
+
+const slugs: Handler = async (s) => {
+  const rows = s.db.all<{ slug: string }>("SELECT slug FROM projects ORDER BY slug");
+  return { slugs: rows.map((row) => row.slug) };
+};
+
+const live_locks: Handler = async (s) => {
+  const rows = s.db.all<{ slug: string; id: string }>("SELECT slug, id FROM projects");
+  const locks: Record<string, string> = {};
+  for (const row of rows) {
+    const lease = s.lease({ id: row.id, slug: row.slug, topic: "", owner_user_id: "", active_edition_id: null, status: "active" });
+    // An agent's lease carries no session label; it still makes the project busy.
+    if (lease !== null) locks[row.slug] = lease.session ?? `agent-run:${lease.run_id}`;
+  }
+  return { locks };
+};
+
+const overview: Handler = async (s, req) => {
+  const project = s.project(req.slug);
+  const stages = s.db.all<{ key: string; status: string; round_no: bigint | null; stale: bigint | null }>(
+    `SELECT s.key AS key, s.status AS status, s.stale_since_event_seq AS stale,
+            (SELECT max(round_no) FROM rounds r WHERE r.project_id = s.project_id AND r.stage_id = s.id) AS round_no
+       FROM stages s WHERE s.project_id = ? AND s.edition_id = ? ORDER BY s.ordinal`,
+    project.id,
+    project.active_edition_id,
+  );
+  const current = s.stage(project, undefined).key;
+  return {
+    topic: project.topic,
+    current,
+    stages: stages.map((st) => ({
+      key: st.key,
+      status: st.status,
+      round_no: Number(st.round_no ?? 0n),
+      stale: st.stale !== null,
+    })),
+  };
+};
+
+const init: Handler = async (s, req) => {
+  // init makes a project with a local human owner. A token never takes that path:
+  // a project-scoped agent token cannot create projects or owners.
+  if (req.token !== undefined && req.token.length > 0) {
+    throw new Refusal("forbidden", "init 은 토큰 없이 이 컴퓨터의 사람만 할 수 있습니다 — PES_TOKEN 을 지우고 다시 하세요");
+  }
+  const args = req.args ?? {};
+  const slug = text_arg(args, "slug");
+  const topic = text_arg(args, "topic");
+  // scripts/pes.ts names a project by its folder, whatever the folder is called (0.15's rule); scripts/pes.py keeps the strict name
+  const folder_named = args.any_name === true && !/[\\/]/.test(slug) && slug.length <= 255;
+  if (!folder_named && !SLUG.test(slug)) {
+    throw new Refusal("invalid_payload", "프로젝트 이름은 소문자·숫자·하이픈(1~64자)만 쓸 수 있습니다", 2);
+  }
+  if (s.db.get("SELECT 1 AS ok FROM projects WHERE slug = ?", slug) !== undefined) {
+    throw new Refusal("conflict", `이미 프로젝트가 있습니다: ${slug}`, 2);
+  }
+  return s.unit(async () => {
+    const out = await s.service.execute(s.ctx(null, null), "project.bootstrap", {
+      slug,
+      topic,
+      owner_display_name: "로컬 소유자",
+      ...(args.any_name === true ? { plan_asking: true } : {}),
+    });
+    const created = result_of(out);
+    let imported = 0;
+    if (is_record(args.library)) {
+      const project = s.project(slug);
+      const auth = s.auth(project, undefined, null);
+      const lib = await import_library(s.service, s.ctx(project, auth), { library: args.library });
+      imported = Array.isArray(result_of(lib).items) ? (result_of(lib).items as unknown[]).length : 0;
+    }
+    return { project_id: created.project_id, imported };
+  });
+};
+
+/**
+ * The number a person sees for a round: the rounds `approve` opened by itself (implicit, see compat_approve) are not counted.
+ * Without any implicit round this is the stored round number.
+ */
+function display_round_no(s: Session, project_id: string, stage_id: string, round_no: number): number {
+  const hidden = s.db.get<{ n: bigint }>(
+    `SELECT count(*) AS n FROM rounds r
+       JOIN mutation_commits mc ON mc.project_id = r.project_id AND mc.action = 'round.started'
+        AND json_extract(mc.result_json, '$.round_id') = r.id
+      WHERE r.project_id = ? AND r.stage_id = ? AND r.round_no < ? AND json_extract(mc.result_json, '$.implicit') = 1`,
+    project_id,
+    stage_id,
+    round_no,
+  );
+  return round_no - Number(hidden?.n ?? 0n);
+}
+
+/** Korean particle 은/는 for a stage name (the last syllable has a final consonant or not). */
+function topic_particle(name: string): string {
+  const last = name.charCodeAt(name.length - 1);
+  return last >= 0xac00 && last <= 0xd7a3 && (last - 0xac00) % 28 !== 0 ? "은" : "는";
+}
+
+const round_start: Handler = async (s, req) => {
+  const { project, auth, guard } = await write_auth(s, req);
+  const stage = s.stage(project, req.args?.stage);
+  if (req.args?.any_order === true) {
+    // D13 (intended difference from 0.15, which let a round start on an approved stage): the database keeps an approved stage closed
+    const now_row = stage_now(s, project, stage);
+    if (now_row.status === "approved" && now_row.stale === null) {
+      const label = STAGE_LABEL[stage.key] ?? stage.key;
+      throw new Refusal("conflict", `round-start: ${label}${topic_particle(label)} 이미 승인됐습니다 — 먼저 reopen 하세요`, 1);
+    }
+    // 0.15 opened rounds back to back; the database wants an open round sealed first. A round with nothing in it (so `render` had nothing
+    // to seal) is closed here with the invisible marker an `approve` uses; one with content still has to be sealed by `render` (conflict).
+    const open = s.db.get<{ id: string }>("SELECT id FROM rounds WHERE project_id = ? AND stage_id = ? AND state = 'open'", project.id, stage.id);
+    if (open !== undefined && manifest_parts(s, project, stage).all.length === 0) {
+      const marker = await approval_marker(s, project, auth, stage);
+      await seal_with_manifest(s, project, auth, guard, open.id, [marker], "manifest.json", {});
+    }
+  }
+  const out = await start_round(s.service, s.ctx(project, auth), { stage_id: stage.id, ...(req.args?.any_order === true ? { any_order: true } : {}) });
+  return { round_no: display_round_no(s, project.id, stage.id, Number(result_of(out).round_no)), round_id: result_of(out).round_id };
+};
+
+interface VersionRef {
+  object_id: string;
+  version_id: string;
+}
+
+/**
+ * The current versions that make up one stage's round snapshot: the stage's own
+ * content artifacts in the active edition (an artifact with no stage belongs to no
+ * stage's snapshot), and the sources those artifacts' current versions cite. Other stages' items never
+ * enter this stage's snapshot.
+ */
+function manifest_versions(s: Session, project: ProjectInfo, stage: StageInfo): VersionRef[] {
+  return manifest_parts(s, project, stage).all;
+}
+
+function manifest_parts(
+  s: Session,
+  project: ProjectInfo,
+  stage: StageInfo,
+): { all: VersionRef[]; items: number } {
+  const artifacts = s.db.all<VersionRef>(
+    `SELECT o.id AS object_id, o.current_version_id AS version_id
+       FROM objects o
+       JOIN artifacts a ON a.project_id = o.project_id AND a.object_id = o.id
+       JOIN artifact_versions cv ON cv.project_id = o.project_id AND cv.version_id = o.current_version_id
+      WHERE o.project_id = ? AND o.edition_id = ? AND a.stage_id = ?
+        AND o.kind = 'artifact' AND a.kind NOT IN ('note', 'review')
+        AND o.archived_at IS NULL AND o.current_version_id IS NOT NULL
+        AND ${not_a_report_sql("cv")}
+      ORDER BY o.display_no`,
+    project.id,
+    stage.edition_id,
+    stage.id,
+  );
+  const sources = s.db.all<VersionRef>(
+    `SELECT so.id AS object_id, so.current_version_id AS version_id
+       FROM objects so
+      WHERE so.project_id = ? AND so.kind = 'source' AND so.archived_at IS NULL
+        AND so.current_version_id IS NOT NULL
+        AND EXISTS (
+          SELECT 1
+            FROM objects o
+            JOIN artifacts a ON a.project_id = o.project_id AND a.object_id = o.id
+            JOIN citations c ON c.project_id = o.project_id AND c.artifact_version_id = o.current_version_id
+            JOIN source_versions sv ON sv.project_id = c.project_id AND sv.version_id = c.source_version_id
+           WHERE o.project_id = so.project_id AND o.edition_id = ? AND a.stage_id = ?
+             AND o.kind = 'artifact' AND a.kind NOT IN ('note', 'review') AND o.archived_at IS NULL
+             AND sv.object_id = so.id)
+      ORDER BY so.display_no`,
+    project.id,
+    stage.edition_id,
+    stage.id,
+  );
+  return { all: [...artifacts, ...sources].map((row) => ({ ...row })), items: artifacts.length };
+}
+
+const render: Handler = async (s, req) => {
+  const { project, auth, guard } = await write_auth(s, req);
+  const stage = s.stage(project, req.args?.stage);
+  const round = s.db.get<{ id: string; round_no: bigint }>(
+    "SELECT id, round_no FROM rounds WHERE project_id = ? AND stage_id = ? AND state = 'open'",
+    project.id,
+    stage.id,
+  );
+  if (round === undefined) {
+    throw new Refusal("conflict", "열린 라운드가 없습니다 — round-start 먼저");
+  }
+  const parts = manifest_parts(s, project, stage);
+  const versions = parts.all;
+  if (versions.length === 0) {
+    throw new Refusal("conflict", "봉인할 항목이 없습니다 — 결과를 먼저 병합하세요");
+  }
+  const bytes = new TextEncoder().encode(JSON.stringify({ versions }));
+  // reserve -> store -> complete -> seal is one unit: when seal refuses (for
+  // example the round was closed meanwhile) no blob row and no receipt remain.
+  // The manifest file already written to disk is not rolled back; it has no row
+  // pointing at it, so the next gc_orphans removes it.
+  const sealed = await s.unit(async () => {
+    const reserved = await reserve_upload(s.service, s.ctx(project, auth), {
+      sha256: sha256_hex(bytes),
+      size: bytes.byteLength,
+      media_type: "application/json",
+      original_name: "manifest.json",
+    });
+    const blob = result_of(reserved);
+    const blob_id = String(blob.blob_id);
+    if (blob.state !== "ready") {
+      await store_blob({ db: s.db, objects_dir: s.objects }, project.id, blob_id, bytes);
+      await complete_upload(s.service, { db: s.db, objects_dir: s.objects }, s.ctx(project, auth), { blob_id });
+    }
+    return seal_round(s.service, s.ctx(project, auth), {
+      round_id: round.id,
+      manifest_blob_id: blob_id,
+      versions,
+      ...guard,
+    });
+  });
+  return {
+    snapshot_id: result_of(sealed).snapshot_id,
+    stage: stage.key,
+    round_id: round.id,
+    round_no: Number(round.round_no),
+    versions: versions.length,
+    items: parts.items,
+  };
+};
+
+/**
+ * The old `handoff_plan`, read from the approved snapshot (the sealed versions,
+ * not whatever was merged after the seal): every plan topic that is not removed and not yet
+ * linked from a research item becomes a research item (kind topic, status new,
+ * question = the topic's question or summary, links.plan = [topic id, ...]).
+ */
+async function hand_over_plan(
+  s: Session,
+  project: ProjectInfo,
+  auth: Auth,
+  plan: StageInfo,
+  snapshot_id: string,
+): Promise<{ made: number; reused: number }> {
+  const research = s.stage(project, "research");
+  const topics = s.db.all<{
+    title: string;
+    question: string | null;
+    summary: string;
+    status: string;
+    metadata_json: string;
+  }>(
+    `SELECT v.title AS title, v.question AS question, v.summary AS summary, v.status AS status,
+            v.metadata_json AS metadata_json
+       FROM snapshots sn
+       JOIN round_contents rc ON rc.project_id = sn.project_id AND rc.round_id = sn.round_id
+       JOIN objects o ON o.project_id = rc.project_id AND o.id = rc.object_id
+       JOIN artifacts a ON a.project_id = o.project_id AND a.object_id = o.id
+       JOIN artifact_versions v ON v.project_id = rc.project_id AND v.version_id = rc.version_id
+      WHERE sn.project_id = ? AND sn.id = ? AND a.stage_id = ? AND o.kind = 'artifact' AND a.kind = 'topic'
+      ORDER BY rc.position`,
+    project.id,
+    snapshot_id,
+    plan.id,
+  );
+  const linked = new Set<string>();
+  const existing = s.db.all<{ metadata_json: string }>(
+    `SELECT v.metadata_json AS metadata_json
+       FROM objects o
+       JOIN artifacts a ON a.project_id = o.project_id AND a.object_id = o.id
+       JOIN artifact_versions v ON v.project_id = o.project_id AND v.version_id = o.current_version_id
+      WHERE o.project_id = ? AND a.stage_id = ? AND o.kind = 'artifact' AND a.kind NOT IN ('note', 'review')`,
+    project.id,
+    research.id,
+  );
+  for (const row of existing) {
+    const row_meta = parse_json_field(row.metadata_json, {}) as Record<string, unknown>;
+    const links = row_meta.links ?? (is_record(row_meta.legacy_extra) ? row_meta.legacy_extra.links : undefined);
+    const from_plan = is_record(links) ? links.plan : undefined;
+    if (Array.isArray(from_plan)) for (const id of from_plan) linked.add(String(id));
+  }
+  let next_id = max_legacy_id(s, project, research);
+  let made = 0;
+  let reused = 0;
+  for (const topic of topics) {
+    if (topic.status === "removed") continue;
+    const meta = parse_json_field(topic.metadata_json, {}) as Record<string, unknown>;
+    // An item merged here keeps legacy_id/legacy_kind/links/reuse in metadata; one imported from a
+    // v0.15 file keeps them in legacy_extra (legacy_id, kind_original, links, reuse_original).
+    const extra: Record<string, unknown> = is_record(meta.legacy_extra) ? meta.legacy_extra : {};
+    const topic_id = meta.legacy_id ?? extra.legacy_id;
+    // The old rule looked at the item's own kind: only a plan item given as "topic".
+    if ((meta.legacy_kind ?? extra.kind_original) !== "topic") continue;
+    if (topic_id === undefined || topic_id === null || linked.has(String(topic_id))) continue;
+    const own_links = meta.links ?? extra.links;
+    const topic_links = is_record(own_links) && Array.isArray(own_links.plan) ? own_links.plan : [];
+    // reuse = an imported library item's id: the new research item carries its content and is to be completed (deepen).
+    const reuse = meta.reuse !== undefined && meta.reuse !== null && meta.reuse !== "" ? meta.reuse : extra.reuse_original;
+    const lib = find_library_item(s, project, reuse);
+    next_id += 1;
+    const created = await create_object(s.service, s.ctx(project, auth), {
+      kind: "artifact",
+      edition_id: research.edition_id,
+    });
+    const links: Record<string, unknown[]> = {
+      plan: [topic_id, ...topic_links.filter((id) => String(id) !== String(topic_id))],
+    };
+    const metadata: Record<string, unknown> = { legacy_id: next_id, legacy_kind: "topic", depth: 0, stage: "research", links };
+    if (lib !== undefined) {
+      reused += 1;
+      links.library = [reuse];
+      metadata.request =
+        `기존 조사(라이브러리 #${String(reuse)}) 재사용 — 기획의 조사 질문에 맞게 보완하고, ` +
+        "원문 미확인 출처와 충돌(⚠)은 다시 확인";
+      const lib_extra = (parse_json_field(lib.metadata_json, {}) as Record<string, unknown>).legacy_extra;
+      if (is_record(lib_extra) && Array.isArray(lib_extra.shots)) metadata.shots = lib_extra.shots;
+      // a confidence the old file wrote outside high/medium/low ("중간") stays as written, like the old copy
+      // (init --import keeps it as legacy_extra.confidence, a whole v0.15 project import as legacy_extra.confidence_original)
+      if (is_record(lib_extra) && "confidence_original" in lib_extra) {
+        metadata.legacy_extra = { confidence_original: lib_extra.confidence_original };
+      } else if (is_record(lib_extra) && "confidence" in lib_extra) {
+        metadata.legacy_extra = { confidence_original: lib_extra.confidence };
+      }
+    }
+    const added = await add_artifact(s.service, s.ctx(project, auth), {
+      object_id: String(result_of(created).object_id),
+      artifact_kind: "topic",
+      stage_id: research.id,
+      title: topic.title,
+      summary: lib?.summary ?? "",
+      question: topic.question || topic.summary || "",
+      body_md: lib?.body_md ?? null,
+      status: lib !== undefined ? "deepen" : "new",
+      confidence: lib?.confidence ?? null,
+      stats: lib !== undefined ? parse_json_field(lib.stats, []) : [],
+      conflicts: lib !== undefined ? parse_json_field(lib.conflicts, []) : [],
+      verify: null,
+      metadata,
+    });
+    if (lib !== undefined) {
+      const version_id = String(result_of(added).version_id);
+      const cites = s.db.all<{ source_version_id: string; quote: string | null; locator: string }>(
+        `SELECT source_version_id, quote, locator FROM citations
+          WHERE project_id = ? AND artifact_version_id = ? ORDER BY citation_no`,
+        project.id,
+        lib.version_id,
+      );
+      for (const c of cites) {
+        await add_citation(s.service, s.ctx(project, auth), {
+          artifact_version_id: version_id,
+          source_version_id: c.source_version_id,
+          quote: c.quote,
+          locator: parse_json_field(c.locator, {}),
+        });
+      }
+    }
+    linked.add(String(topic_id));
+    made += 1;
+  }
+  return { made, reused };
+}
+
+/** An imported library item (an artifact outside every stage) by its old id, as `handoff_plan` looked it up. */
+function find_library_item(s: Session, project: ProjectInfo, reuse: unknown): PrevArtifact | undefined {
+  if (reuse === undefined || reuse === null || reuse === "") return undefined;
+  if (typeof reuse !== "number" && typeof reuse !== "string") return undefined;
+  return s.db.get<PrevArtifact>(
+    `SELECT o.id AS object_id, v.version_id AS version_id, v.title AS title, v.question AS question,
+            v.summary AS summary, v.body_md AS body_md, v.status AS status, v.confidence AS confidence,
+            v.stats AS stats, v.conflicts AS conflicts, v.verify AS verify, v.metadata_json AS metadata_json
+       FROM objects o
+       JOIN artifacts a ON a.project_id = o.project_id AND a.object_id = o.id
+       JOIN artifact_versions v ON v.project_id = o.project_id AND v.version_id = o.current_version_id
+      WHERE o.project_id = ? AND a.stage_id IS NULL AND o.kind = 'artifact'
+        AND a.kind NOT IN ('review', 'report', 'output')
+        AND json_extract(v.metadata_json, '$.legacy_extra.legacy_id') = ?
+      LIMIT 1`,
+    project.id,
+    reuse,
+  );
+}
+
+const approve: Handler = async (s, req) => {
+  const { project, auth } = await write_auth(s, req);
+  const stage = s.stage(project, req.args?.stage);
+  const round =
+    stage.current_round_id === null
+      ? undefined
+      : s.db.get<{ state: string; sealed_snapshot_id: string | null }>(
+          "SELECT state, sealed_snapshot_id FROM rounds WHERE project_id = ? AND id = ?",
+          project.id,
+          stage.current_round_id,
+        );
+  if (round === undefined || round.state !== "sealed" || round.sealed_snapshot_id === null) {
+    throw new Refusal("conflict", "봉인된 라운드가 없어 승인할 수 없습니다 — render 먼저");
+  }
+  let made: { made: number; reused: number } | null = null;
+  const out = await s.unit(async () => {
+    const approved = await approve_stage(s.service, s.ctx(project, auth), {
+      stage_id: stage.id,
+      snapshot_id: round.sealed_snapshot_id as string,
+    });
+    // Approving the plan hands its research questions to the research stage in
+    // the same unit, as the old CLI's handoff_plan did.
+    if (stage.key === "plan") made = await hand_over_plan(s, project, auth, stage, round.sealed_snapshot_id as string);
+    return approved;
+  });
+  const result = result_of(out);
+  let next: { key: string; status: string } | null = null;
+  if (typeof result.next_stage_id === "string") {
+    const row = s.db.get<{ key: string; status: string }>(
+      "SELECT key, status FROM stages WHERE project_id = ? AND id = ?",
+      project.id,
+      result.next_stage_id,
+    );
+    next = row === undefined ? null : { ...row };
+  }
+  const done = made as { made: number; reused: number } | null;
+  return { next, complete: result.edition_completed === true, handed_over: done === null ? null : done.made, reused: done === null ? null : done.reused };
+};
+
+const reopen: Handler = async (s, req) => {
+  const { project, auth } = await write_auth(s, req);
+  const stage = s.stage(project, req.args?.stage);
+  await reopen_stage(s.service, s.ctx(project, auth), { stage_id: stage.id });
+  const later = s.db.all<{ key: string }>(
+    `SELECT key FROM stages
+      WHERE project_id = ? AND edition_id = ? AND ordinal > ? AND status <> 'pending'
+        AND stale_since_event_seq IS NOT NULL
+      ORDER BY ordinal`,
+    project.id,
+    stage.edition_id,
+    stage.ordinal,
+  );
+  return { marked: later.map((row) => row.key) };
+};
+
+// compat_* : v0.15's render / approve / reopen on top of the rounds and snapshots (scripts/pes.ts) ---------------------------------
+
+interface StageNow {
+  status: string;
+  stale: bigint | null;
+  current_round_id: string | null;
+}
+
+function stage_now(s: Session, project: ProjectInfo, stage: StageInfo): StageNow {
+  const row = s.db.get<StageNow>(
+    "SELECT status, stale_since_event_seq AS stale, current_round_id FROM stages WHERE project_id = ? AND id = ?",
+    project.id,
+    stage.id,
+  );
+  if (row === undefined) throw new Refusal("not_found", "단계를 찾을 수 없습니다");
+  return { ...row };
+}
+
+/** Seals one open round: the manifest goes to the object store, then the core seals it (one unit). Returns the snapshot id. */
+async function seal_with_manifest(
+  s: Session,
+  project: ProjectInfo,
+  auth: Auth,
+  guard: Record<string, unknown>,
+  round_id: string,
+  versions: VersionRef[],
+  manifest_name: string,
+  manifest_extra: Record<string, unknown>,
+): Promise<string> {
+  const bytes = new TextEncoder().encode(JSON.stringify({ versions, ...manifest_extra }));
+  const sealed = await s.unit(async () => {
+    const reserved = await reserve_upload(s.service, s.ctx(project, auth), {
+      sha256: sha256_hex(bytes),
+      size: bytes.byteLength,
+      media_type: "application/json",
+      original_name: manifest_name,
+    });
+    const blob = result_of(reserved);
+    const blob_id = String(blob.blob_id);
+    if (blob.state !== "ready") {
+      await store_blob({ db: s.db, objects_dir: s.objects }, project.id, blob_id, bytes);
+      await complete_upload(s.service, { db: s.db, objects_dir: s.objects }, s.ctx(project, auth), { blob_id });
+    }
+    return seal_round(s.service, s.ctx(project, auth), { round_id, manifest_blob_id: blob_id, versions, ...guard });
+  });
+  return String(result_of(sealed).snapshot_id);
+}
+
+/** A round has to hold at least one version to be sealed; a stage without items gets one invisible marker note. */
+async function approval_marker(s: Session, project: ProjectInfo, auth: Auth, stage: StageInfo): Promise<VersionRef> {
+  const made = await create_object(s.service, s.ctx(project, auth), { kind: "artifact", edition_id: stage.edition_id });
+  const object_id = String(result_of(made).object_id);
+  const added = await add_artifact(s.service, s.ctx(project, auth), {
+    object_id,
+    artifact_kind: "note",
+    stage_id: stage.id,
+    title: "(승인 표지)",
+    status: "done",
+    metadata: { role: "approval_marker", stage: stage.key },
+  });
+  return { object_id, version_id: String(result_of(added).version_id) };
+}
+
+/** v0.15 `render`: seal the open round when it has content. A round that is sealed already, or has nothing in it, is left as it is. */
+const compat_render: Handler = async (s, req) => {
+  const { project, auth, guard } = await write_auth(s, req);
+  const stage = s.stage(project, req.args?.stage);
+  const round = s.db.get<{ id: string }>("SELECT id FROM rounds WHERE project_id = ? AND stage_id = ? AND state = 'open'", project.id, stage.id);
+  if (round === undefined) return { sealed: false };
+  const versions = manifest_parts(s, project, stage).all;
+  if (versions.length === 0) return { sealed: false };
+  await seal_with_manifest(s, project, auth, guard, round.id, versions, "manifest.json", {});
+  return { sealed: true };
+};
+
+/**
+ * v0.15 `approve`, on the database's order rule (intended difference D13): a stage whose earlier stage is not approved is refused
+ * with one Korean line — v0.15 approved it, the database's guarantee that an approval rests on approved work is not loosened.
+ * The database approves a stage on a sealed round of its own and only once, so:
+ *  - an approved stage (not invalidated) that is approved again stays as it is: one approval per approved state, nothing is written;
+ *  - the open round is sealed; with none (or one sealed before the stage was last invalidated) a round is opened and sealed by the
+ *    CLI itself — marked implicit (in the round's receipt, set by the server) so the read model does not count it as a round of the work.
+ */
+const compat_approve: Handler = async (s, req) => {
+  const { project, auth, guard } = await write_auth(s, req);
+  const stage = s.stage(project, req.args?.stage);
+  const earlier = s.db.get<{ key: string }>(
+    `SELECT key FROM stages
+      WHERE project_id = ? AND edition_id = ? AND ordinal < ? AND (status <> 'approved' OR stale_since_event_seq IS NOT NULL)
+      ORDER BY ordinal LIMIT 1`,
+    project.id,
+    stage.edition_id,
+    stage.ordinal,
+  );
+  if (earlier !== undefined) {
+    throw new Refusal("conflict", `approve: 앞 단계(${STAGE_LABEL[earlier.key] ?? earlier.key})가 아직 승인되지 않았습니다`, 1);
+  }
+  return s.unit(async () => {
+    let now_row = stage_now(s, project, stage);
+    if (now_row.status === "approved" && now_row.stale === null) {
+      // 0.15 took a second `approve` of the same stage and wrote another history line; the database keeps ONE approval per approved
+      // state, so the stage stays as it is (nothing new is handed over, the person gets the same answer as for the first one). The only
+      // trace is an invisible review artifact the read model turns into that history line.
+      const made = await create_object(s.service, s.ctx(project, auth), { kind: "artifact", edition_id: stage.edition_id });
+      await add_artifact(s.service, s.ctx(project, auth), {
+        object_id: String(result_of(made).object_id),
+        artifact_kind: "review",
+        stage_id: stage.id,
+        title: "(승인 다시 받음)",
+        status: "done",
+        metadata: { role: "reapproval", stage: stage.key },
+      });
+      const after = s.db.get<{ key: string; status: string }>(
+        "SELECT key, status FROM stages WHERE project_id = ? AND edition_id = ? AND ordinal = ?",
+        project.id,
+        stage.edition_id,
+        stage.ordinal + 1,
+      );
+      const edition = s.db.get<{ status: string }>("SELECT status FROM editions WHERE project_id = ? AND id = ?", project.id, stage.edition_id);
+      return {
+        next: after === undefined ? null : { ...after },
+        complete: edition?.status === "completed",
+        handed_over: stage.key === "plan" ? 0 : null,
+        reused: stage.key === "plan" ? 0 : null,
+      };
+    }
+    const open = s.db.get<{ id: string }>("SELECT id FROM rounds WHERE project_id = ? AND stage_id = ? AND state = 'open'", project.id, stage.id);
+    let snapshot_id: string | null = null;
+    if (open === undefined && now_row.current_round_id !== null) {
+      const sealed = s.db.get<{ sealed_snapshot_id: string | null; through: bigint | null }>(
+        `SELECT r.sealed_snapshot_id AS sealed_snapshot_id, sn.through_event_seq AS through
+           FROM rounds r LEFT JOIN snapshots sn ON sn.project_id = r.project_id AND sn.id = r.sealed_snapshot_id
+          WHERE r.project_id = ? AND r.id = ? AND r.state = 'sealed'`,
+        project.id,
+        now_row.current_round_id,
+      );
+      const reopened = s.db.get<{ n: bigint | null }>(
+        "SELECT max(event_seq) AS n FROM events WHERE project_id = ? AND type = 'stage.reopened' AND json_extract(payload, '$.stage_id') = ?",
+        project.id,
+        stage.id,
+      );
+      const invalidation = now_row.stale !== null ? Number(now_row.stale) : reopened?.n === null || reopened === undefined ? null : Number(reopened.n);
+      if (sealed?.sealed_snapshot_id && (invalidation === null || (sealed.through !== null && Number(sealed.through) >= invalidation))) {
+        snapshot_id = sealed.sealed_snapshot_id;
+      }
+    }
+    if (snapshot_id === null) {
+      let round_id: string;
+      let implicit = false;
+      if (open !== undefined) {
+        round_id = open.id;
+      } else {
+        const started = await start_round(s.service, s.ctx(project, auth), { stage_id: stage.id, implicit: true });
+        round_id = String(result_of(started).round_id);
+        implicit = true;
+      }
+      let versions = manifest_parts(s, project, stage).all;
+      if (versions.length === 0) versions = [await approval_marker(s, project, auth, stage)];
+      snapshot_id = await seal_with_manifest(s, project, auth, guard, round_id, versions, implicit ? IMPLICIT_MANIFEST : "manifest.json", implicit ? { implicit: true } : {});
+    }
+    const approved = await approve_stage(s.service, s.ctx(project, auth), { stage_id: stage.id, snapshot_id });
+    let made: { made: number; reused: number } | null = null;
+    if (stage.key === "plan") made = await hand_over_plan(s, project, auth, stage, snapshot_id);
+    const result = result_of(approved);
+    let next: { key: string; status: string } | null = null;
+    if (typeof result.next_stage_id === "string") {
+      const row = s.db.get<{ key: string; status: string }>("SELECT key, status FROM stages WHERE project_id = ? AND id = ?", project.id, result.next_stage_id);
+      next = row === undefined ? null : { ...row };
+    }
+    return { next, complete: result.edition_completed === true, handed_over: made === null ? null : made.made, reused: made === null ? null : made.reused };
+  });
+};
+
+/** v0.15 `reopen`: the stage is approved again-able, later stages that were started are marked "check again". */
+const compat_reopen: Handler = async (s, req) => {
+  const { project, auth } = await write_auth(s, req);
+  const stage = s.stage(project, req.args?.stage);
+  if (stage_now(s, project, stage).status !== "approved") {
+    throw new Refusal("conflict", `${stage.key} 단계는 승인된 단계가 아니라 다시 열 수 없습니다`);
+  }
+  await reopen_stage(s.service, s.ctx(project, auth), { stage_id: stage.id });
+  const later = s.db.all<{ key: string }>(
+    `SELECT key FROM stages
+      WHERE project_id = ? AND edition_id = ? AND ordinal > ? AND status <> 'pending' AND stale_since_event_seq IS NOT NULL
+      ORDER BY ordinal`,
+    project.id,
+    stage.edition_id,
+    stage.ordinal,
+  );
+  return { marked: later.map((row) => row.key) };
+};
+
+// set_field : `pes set` — one whitelisted field, replaced whole (scripts/pes.ts) ---------------------------------------------------
+
+const SET_STAGE_FIELDS = new Set(["summary", "changes", "carry_over", "settings", "review"]);
+const SET_PROJECT_FIELDS = new Set(["executive_summary", "conclusion"]);
+
+/**
+ * The values `set` writes have no table of their own: each (stage or project, field) is one invisible "review" artifact whose newest
+ * version carries the value (metadata role stage_field / project_field). Review artifacts are in no snapshot and no item list; the read
+ * model (legacy_view) puts the value back where v0.15 kept it. Writing the same value again changes nothing.
+ */
+const set_field: Handler = async (s, req) => {
+  const { project, auth } = await write_auth(s, req);
+  const args = req.args ?? {};
+  const target = args.target;
+  const field = args.field;
+  if (typeof target !== "string" || typeof field !== "string") throw new Refusal("invalid_payload", "set: 대상과 필드가 필요합니다", 2);
+  const whole_project = target === "project";
+  if (!(whole_project ? SET_PROJECT_FIELDS : SET_STAGE_FIELDS).has(field) || !("value" in args)) {
+    throw new Refusal("invalid_payload", `set: 쓸 수 없는 필드입니다: ${target}.${field}`, 2);
+  }
+  const stage = whole_project ? null : s.stage(project, target);
+  const role = whole_project ? "project_field" : "stage_field";
+  const metadata = { role, field, value: args.value, stage: stage === null ? null : stage.key };
+  // The read of the current value and the write are ONE unit (BEGIN IMMEDIATE): two `set` of the same field (even from two folders of
+  // the same name, whose lock files differ) see each other's result, so the field stays one object and no later `set` is lost.
+  return s.unit(async () => {
+    const current = s.db.get<{ object_id: string; version_id: string; metadata_json: string }>(
+      `SELECT o.id AS object_id, v.version_id AS version_id, v.metadata_json AS metadata_json
+         FROM objects o
+         JOIN artifacts a ON a.project_id = o.project_id AND a.object_id = o.id
+         JOIN artifact_versions v ON v.project_id = o.project_id AND v.version_id = o.current_version_id
+        WHERE o.project_id = ? AND o.kind = 'artifact' AND a.kind = 'review'
+          AND ((? IS NULL AND a.stage_id IS NULL) OR a.stage_id = ?)
+          AND json_extract(v.metadata_json, '$.role') = ? AND json_extract(v.metadata_json, '$.field') = ?
+        ORDER BY o.display_no LIMIT 1`,
+      project.id,
+      stage === null ? null : stage.id,
+      stage === null ? null : stage.id,
+      role,
+      field,
+    );
+    if (current !== undefined && same_json(parse_json_field(current.metadata_json, {}), metadata)) return { changed: false };
+    const title = `(${whole_project ? "프로젝트" : stage?.key} ${field})`;
+    if (current === undefined) {
+      const created = await create_object(s.service, s.ctx(project, auth), { kind: "artifact", edition_id: project.active_edition_id });
+      const object_id = String(result_of(created).object_id);
+      await add_artifact(s.service, s.ctx(project, auth), {
+        object_id,
+        artifact_kind: "review",
+        ...(stage === null ? {} : { stage_id: stage.id }),
+        title,
+        status: "done",
+        metadata,
+      });
+    } else {
+      const appended = await append_version(s.service, s.ctx(project, auth), {
+        object_id: current.object_id,
+        based_on_version_id: current.version_id,
+        title,
+        status: "done",
+        metadata,
+      });
+      await set_current(s.service, s.ctx(project, auth), { object_id: current.object_id, version_id: String(result_of(appended).version_id) });
+    }
+    return { changed: true };
+  });
+};
+
+const note: Handler = async (s, req) => {
+  const { project, auth } = await write_auth(s, req);
+  const args = req.args ?? {};
+  // scripts/pes.ts: `note <dir>` with no text stored an empty note in v0.15 and still does (allow_blank); the API and pes.py refuse blank text
+  const payload = {
+    ...(args.allow_blank === true && args.text === "" ? { text: "", allow_blank: true } : { text: text_arg(args, "text") }),
+    // a project without a current stage (a hand-written v0.15 file) keeps the note on no stage, as 0.15 did — the CLI's option only
+    ...(args.allow_blank === true ? { stage_optional: true } : {}),
+  };
+  const out = await add_note(s.service, s.ctx(project, auth), payload);
+  return { note_count: result_of(out).note_count };
+};
+
+const mark: Handler = async (s, req) => {
+  const { project, auth } = await write_auth(s, req);
+  const names = req.args?.names;
+  const out = await mark_processed(s.service, s.ctx(project, auth), { names });
+  return { count: result_of(out).count };
+};
+
+const chat: Handler = async (s, req) => {
+  const { project, auth } = await write_auth(s, req);
+  const args = req.args ?? {};
+  const stage = s.stage(project, args.stage);
+  // scripts/pes.ts `chat`: 0.15 recorded an empty or blank answer (exit 0, like `note` with no text) — only when the caller asks
+  // (allow_blank, sent by cmd_chat). pes.py's DB path does not ask, so it refuses blank text as before SEL-71.
+  const blank_ok = args.allow_blank === true;
+  if (blank_ok && typeof args.text !== "string") throw new Refusal("invalid_payload", "text 값이 필요합니다", 2);
+  const out = await record_chat(s.service, s.ctx(project, auth), {
+    stage: stage.key,
+    ...(blank_ok ? { text: args.text, allow_blank: true } : { text: text_arg(args, "text") }),
+    kind: typeof args.kind === "string" && args.kind.length > 0 ? args.kind : "feedback",
+  });
+  return { object_id: result_of(out).object_id };
+};
+
+const ask_prep: Handler = async (s, req) => {
+  const { project, auth } = await write_auth(s, req);
+  const args = req.args ?? {};
+  const out = await prepare_question_draft(s.service, s.ctx(project, auth), {
+    stage: s.stage(project, args.stage).key,
+    bank_key: text_arg(args, "bank_key"),
+  });
+  return { round_no: result_of(out).round_no };
+};
+
+const ask: Handler = async (s, req) => {
+  const { project, auth, guard } = await write_auth(s, req);
+  const args = req.args ?? {};
+  const stage = s.stage(project, args.stage);
+  const open = s.db.get<{ id: string }>(
+    "SELECT id FROM rounds WHERE project_id = ? AND stage_id = ? AND state = 'open'",
+    project.id,
+    stage.id,
+  );
+  const payload: Record<string, unknown> = {
+    stage_id: stage.id,
+    purpose: args.purpose,
+    form_key: args.form_key,
+    questions: args.questions,
+    ...guard,
+  };
+  if (open !== undefined) payload.round_id = open.id;
+  const out = await publish_set(s.service, s.ctx(project, auth), payload);
+  const result = result_of(out);
+  return { set_id: result.set_id, version_no: result.set_version_no };
+};
+
+// merge -----------------------------------------------------------------
+
+/** Would merging `raw` change the stored item `prev`? (everything the merge writes, except the depth it counts up) */
+function fields_changed(s: Session, project: ProjectInfo, prev: PrevArtifact, fields: Record<string, unknown>, raw: Record<string, unknown>): boolean {
+  const prev_meta = parse_json_field(prev.metadata_json, {}) as Record<string, unknown>;
+  const next_meta = { ...(fields.metadata as Record<string, unknown>), depth: prev_meta.depth };
+  const now_fields: Record<string, unknown> = {
+    title: prev.title,
+    summary: prev.summary,
+    question: prev.question,
+    body_md: prev.body_md,
+    status: prev.status,
+    confidence: prev.confidence,
+    stats: parse_json_field(prev.stats, []),
+    conflicts: parse_json_field(prev.conflicts, []),
+    verify: parse_json_field(prev.verify, null),
+    metadata: prev_meta,
+  };
+  const next_fields: Record<string, unknown> = { ...fields, metadata: next_meta };
+  for (const key of Object.keys(now_fields)) {
+    if (!same_json(now_fields[key], next_fields[key])) return true;
+  }
+  const have = new Set(
+    s.db
+      .all<{ url: string | null }>(
+        `SELECT sv.url AS url FROM citations c JOIN source_versions sv ON sv.project_id = c.project_id AND sv.version_id = c.source_version_id
+          WHERE c.project_id = ? AND c.artifact_version_id = ?`,
+        project.id,
+        prev.version_id,
+      )
+      .map((row) => row.url),
+  );
+  for (const src of Array.isArray(raw.sources) ? raw.sources : []) {
+    if (!is_record(src)) continue;
+    if (typeof src.url !== "string" || src.url.length === 0 || !have.has(src.url)) return true;
+  }
+  return false;
+}
+
+interface PrevArtifact {
+  object_id: string;
+  version_id: string;
+  title: string;
+  question: string | null;
+  summary: string;
+  body_md: string | null;
+  status: string;
+  confidence: string | null;
+  stats: string;
+  conflicts: string;
+  verify: string;
+  metadata_json: string;
+}
+
+function find_previous(s: Session, project: ProjectInfo, stage: StageInfo, legacy_id: unknown): PrevArtifact | undefined {
+  if (legacy_id === undefined || legacy_id === null) return undefined;
+  return s.db.get<PrevArtifact>(
+    `SELECT o.id AS object_id, v.version_id AS version_id, v.title AS title, v.question AS question,
+            v.summary AS summary, v.body_md AS body_md, v.status AS status, v.confidence AS confidence,
+            v.stats AS stats, v.conflicts AS conflicts, v.verify AS verify, v.metadata_json AS metadata_json
+       FROM objects o
+       JOIN artifacts a ON a.project_id = o.project_id AND a.object_id = o.id
+       JOIN artifact_versions v ON v.project_id = o.project_id AND v.version_id = o.current_version_id
+      WHERE o.project_id = ? AND a.stage_id = ? AND o.kind = 'artifact' AND a.kind NOT IN ('note', 'review')
+        AND COALESCE(json_extract(v.metadata_json, '$.legacy_id'), json_extract(v.metadata_json, '$.legacy_extra.legacy_id')) = ?
+      LIMIT 1`,
+    project.id,
+    stage.id,
+    typeof legacy_id === "number" ? legacy_id : String(legacy_id),
+  );
+}
+
+function clean_text(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  return value.replace(/<br\s*\/?>/gi, "\n");
+}
+
+function parse_json_field(text: string, fallback: unknown): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return fallback;
+  }
+}
+
+/** Highest numeric legacy id among a stage's items (0 when none): the old CLI's `max(items) + 1`. */
+function max_legacy_id(s: Session, project: ProjectInfo, stage: StageInfo): number {
+  const rows = s.db.all<{ legacy_id: unknown }>(
+    `SELECT COALESCE(json_extract(v.metadata_json, '$.legacy_id'), json_extract(v.metadata_json, '$.legacy_extra.legacy_id')) AS legacy_id
+       FROM objects o
+       JOIN artifacts a ON a.project_id = o.project_id AND a.object_id = o.id
+       JOIN artifact_versions v ON v.project_id = o.project_id AND v.version_id = o.current_version_id
+      WHERE o.project_id = ? AND a.stage_id = ? AND o.kind = 'artifact' AND a.kind NOT IN ('note', 'review')`,
+    project.id,
+    stage.id,
+  );
+  let highest = 0;
+  for (const row of rows) {
+    const value = typeof row.legacy_id === "bigint" ? Number(row.legacy_id) : row.legacy_id;
+    if (typeof value === "number" && Number.isSafeInteger(value) && value > highest) highest = value;
+  }
+  return highest;
+}
+
+function same_json(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (Array.isArray(a)) {
+    return Array.isArray(b) && a.length === b.length && a.every((x, i) => same_json(x, b[i]));
+  }
+  if (is_record(a)) {
+    if (!is_record(b)) return false;
+    const keys = Object.keys(a);
+    return keys.length === Object.keys(b).length && keys.every((k) => k in b && same_json(a[k], b[k]));
+  }
+  return false;
+}
+
+/** The old merge's accumulation: keep what is there, append what is new (compared as JSON), keep the order. */
+function union_json(current: unknown, incoming: unknown[]): unknown[] {
+  const out: unknown[] = Array.isArray(current) ? [...current] : [];
+  for (const x of incoming) if (!out.some((y) => same_json(x, y))) out.push(x);
+  return out;
+}
+
+/** links: per key a union; a scalar value counts as a one-element list (the old merge). */
+function union_links(current: unknown, incoming: Record<string, unknown>): Record<string, unknown[]> {
+  const out: Record<string, unknown[]> = {};
+  if (is_record(current)) {
+    for (const [k, v] of Object.entries(current)) out[k] = Array.isArray(v) ? [...v] : [v];
+  }
+  for (const [k, v] of Object.entries(incoming)) {
+    out[k] = union_json(out[k] ?? [], Array.isArray(v) ? v : [v]);
+  }
+  return out;
+}
+
+/** Keys of a control-only proposal (status/request/user_links and the id they apply to). */
+const CONTROL_KEYS = new Set(["id", "status", "request", "user_links"]);
+
+function is_control_only(raw: Record<string, unknown>): boolean {
+  const keys = Object.keys(raw);
+  return keys.every((k) => CONTROL_KEYS.has(k)) && keys.some((k) => k !== "id");
+}
+
+/**
+ * user_links (links the user handed in, with a todo/done/failed status): a link whose url is already
+ * there only gets the fields given (status, memo, added); a new url is appended with status "todo".
+ */
+function merge_user_links(current: unknown, incoming: unknown[]): Record<string, unknown>[] {
+  const out: Record<string, unknown>[] = Array.isArray(current)
+    ? current.filter(is_record).map((x) => ({ ...x }))
+    : [];
+  for (const x of incoming) {
+    if (!is_record(x) || typeof x.url !== "string" || x.url.length === 0) continue;
+    const old = out.find((u) => u.url === x.url);
+    if (old === undefined) {
+      const added: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(x)) if (v !== undefined && v !== null) added[k] = v;
+      if (typeof added.status !== "string" || added.status.length === 0) added.status = "todo";
+      out.push(added);
+    } else {
+      for (const [k, v] of Object.entries(x)) if (v !== undefined && v !== null && v !== "") old[k] = v;
+    }
+  }
+  return out;
+}
+
+const CONFIDENCES = ["high", "medium", "low"];
+
+/** What the old source dictionary carried besides title/url/method (the importer keeps the same four keys in the locator). */
+function source_locator(src: Record<string, unknown>): Record<string, unknown> {
+  const locator: Record<string, unknown> = {};
+  for (const key of ["date", "note", "orgId", "tblId"]) if (src[key] !== undefined) locator[key] = src[key];
+  return locator;
+}
+
+const merge: Handler = async (s, req) => {
+  const { project, auth } = await write_auth(s, req);
+  const args = req.args ?? {};
+  const stage = s.stage(project, args.stage);
+  const results = args.results;
+  if (!Array.isArray(results)) throw new Refusal("invalid_payload", "results 배열이 필요합니다", 2);
+  // Check every item before the first write; the unit below then makes the
+  // whole merge one all-or-nothing change (the old CLI saved once at the end).
+  const items: Record<string, unknown>[] = [];
+  for (const raw of results) {
+    if (!is_record(raw)) throw new Refusal("invalid_payload", "결과 항목은 JSON 객체여야 합니다", 2);
+    // v0.15 kept whatever status it was given; an unknown value is refused here
+    // instead of being turned into "done" (nothing is written yet at this point).
+    const given_status = raw.status;
+    if (given_status !== undefined && given_status !== null && given_status !== "") {
+      if (typeof given_status !== "string" || !ARTIFACT_STATUSES.has(given_status)) {
+        throw new Refusal("invalid_payload", `알 수 없는 status 값입니다: ${String(given_status)}`, 2);
+      }
+    }
+    if ("user_links" in raw && !Array.isArray(raw.user_links)) {
+      throw new Refusal("invalid_payload", `user_links 는 객체 목록이어야 합니다 (#${String(raw.id)})`, 2);
+    }
+    const given_confidence = raw.confidence;
+    if (given_confidence !== undefined && given_confidence !== null && given_confidence !== "") {
+      if (typeof given_confidence !== "string" || !CONFIDENCES.includes(given_confidence)) {
+        throw new Refusal("invalid_payload", `알 수 없는 confidence 값입니다: ${String(given_confidence)}`, 2);
+      }
+    }
+    // `sources` must be a list of objects (a missing, null or empty one is fine). 0.15 raised a traceback in the middle of the merge
+    // for a string / number / list of strings (D11); nothing is written here, and the whole batch is refused, with one plain line.
+    const given_sources = raw.sources;
+    const empty_sources = given_sources === undefined || given_sources === null || given_sources === "" || given_sources === 0 || given_sources === false;
+    if (!empty_sources && !(Array.isArray(given_sources) && given_sources.every(is_record)) && !(is_record(given_sources) && Object.keys(given_sources).length === 0)) {
+      throw new Refusal("invalid_payload", `merge: sources 는 출처 객체의 목록이어야 합니다 (#${String(raw.id ?? "")})`, req.args?.v015 === true ? 1 : 2);
+    }
+    items.push(raw);
+  }
+  let next_id: number | null = null;
+  return s.unit(async () => {
+  let merged = 0;
+  for (const raw of items) {
+    let legacy_id: unknown = raw.id;
+    if (legacy_id === undefined || legacy_id === null) {
+      // The old merge numbered an item without an id as the stage's highest + 1.
+      next_id = (next_id ?? max_legacy_id(s, project, stage)) + 1;
+      legacy_id = next_id;
+    } else if (typeof legacy_id === "number" && next_id !== null && legacy_id > next_id) {
+      next_id = legacy_id;
+    }
+    const prev = find_previous(s, project, stage, legacy_id);
+    if (prev === undefined && is_control_only(raw)) {
+      // a status/request-only proposal for an id that is not there is a typo, not a new item (the unit rolls back)
+      throw new Refusal(
+        "invalid_payload",
+        `없는 항목 #${String(raw.id ?? "")} 에 상태·요청만 담은 제안입니다 — show 로 번호를 확인하세요`,
+        2,
+      );
+    }
+    const prev_meta = prev === undefined ? {} : (parse_json_field(prev.metadata_json, {}) as Record<string, unknown>);
+    const prev_fields: Partial<PrevArtifact> = prev ?? {};
+    // A proposal that only carries status/request/user_links (deepen, revise, remove, a user's link) is a
+    // control change, not merged content: like the old direct edit it neither raises depth nor turns the item "done".
+    const control_only = is_control_only(raw);
+    const given = typeof raw.status === "string" && raw.status.length > 0 ? raw.status : null;
+    const status = given ?? (control_only ? prev?.status ?? "new" : "done");
+    // An item imported from a v0.15 file keeps its old values in legacy_extra (kind_original, depth,
+    // links, shots, status_original, confidence_original); the first merge carries them over here.
+    const prev_extra: Record<string, unknown> = is_record(prev_meta.legacy_extra) ? { ...prev_meta.legacy_extra } : {};
+    // the old view prefers status_original/confidence_original: drop them once this merge sets a new value
+    if (given !== null || !control_only) delete prev_extra.status_original;
+    if (typeof raw.confidence === "string" && raw.confidence.length > 0) delete prev_extra.confidence_original;
+    const prev_kind = prev_meta.legacy_kind ?? prev_extra.kind_original;
+    const metadata: Record<string, unknown> = {
+      ...prev_meta,
+      legacy_id: legacy_id ?? prev_meta.legacy_id ?? prev_extra.legacy_id ?? null,
+      legacy_kind: typeof raw.kind === "string" ? raw.kind : typeof prev_kind === "string" ? prev_kind : "",
+      depth: Number(prev_meta.depth ?? prev_extra.depth ?? 0) + (control_only ? 0 : 1),
+      stage: stage.key,
+    };
+    if (prev_meta.links === undefined && is_record(prev_extra.links)) metadata.links = prev_extra.links;
+    if (prev_meta.shots === undefined && Array.isArray(prev_extra.shots)) metadata.shots = prev_extra.shots;
+    if (prev_meta.legacy_extra !== undefined) metadata.legacy_extra = prev_extra;
+    for (const key of ["order", "verdict", "path", "open_questions", "reuse", "model"]) {
+      if (raw[key] !== undefined && raw[key] !== null && raw[key] !== "") metadata[key] = raw[key];
+    }
+    // request: overwritten only when given; an empty string clears it.
+    if (typeof raw.request === "string") metadata.request = raw.request;
+    if (Array.isArray(raw.user_links)) metadata.user_links = merge_user_links(prev_meta.user_links, raw.user_links);
+    // shots and links accumulate across rounds like the old merge (no duplicates).
+    if (Array.isArray(raw.shots) && raw.shots.length > 0) metadata.shots = union_json(metadata.shots, raw.shots);
+    if (is_record(raw.links) && Object.keys(raw.links).length > 0) metadata.links = union_links(metadata.links, raw.links);
+    const confidence =
+      typeof raw.confidence === "string" && raw.confidence.length > 0 ? raw.confidence : prev_fields.confidence ?? null;
+    const fields: Record<string, unknown> = {
+      title: clean_text(raw.title) || prev_fields.title || `항목 ${String(legacy_id)}`.trim(),
+      summary: clean_text(raw.summary) ?? prev_fields.summary ?? "",
+      question: clean_text(raw.question) ?? prev_fields.question ?? null,
+      body_md: clean_text(raw.details) ?? prev_fields.body_md ?? null,
+      status,
+      confidence,
+      stats: Array.isArray(raw.stats)
+        ? raw.stats.map((x) => (is_record(x) ? { ...x, name: x.name ?? x.label ?? "" } : x))
+        : parse_json_field(prev_fields.stats ?? "[]", []),
+      conflicts: Array.isArray(raw.conflicts)
+        ? union_json(parse_json_field(prev_fields.conflicts ?? "[]", []), raw.conflicts)
+        : parse_json_field(prev_fields.conflicts ?? "[]", []),
+      verify: raw.verify !== undefined ? raw.verify : parse_json_field(prev_fields.verify ?? "null", null),
+      metadata,
+    };
+    // v0.15 defect (D06, SEL-12): sending the same result again raised `depth` again. scripts/pes.ts (v015) keeps the item as it is.
+    if (req.args?.v015 === true && prev !== undefined && !control_only && !fields_changed(s, project, prev, fields, raw)) {
+      merged += 1;
+      continue;
+    }
+    let object_id: string;
+    let version_id: string;
+    let appended_version = false;
+    const replaces_sources =
+      (stage.key === "write" || metadata.legacy_kind === "section") && Array.isArray(raw.sources);
+    const carried: Array<{ source_version_id: string; quote: string | null; locator: unknown }> = [];
+    if (prev === undefined) {
+      const kind =
+        typeof raw.kind === "string" && ARTIFACT_KINDS.has(raw.kind) && raw.kind !== "note" && raw.kind !== "review"
+          ? raw.kind
+          : "topic";
+      const created = await create_object(s.service, s.ctx(project, auth), {
+        kind: "artifact",
+        edition_id: stage.edition_id,
+      });
+      object_id = String(result_of(created).object_id);
+      const added = await add_artifact(s.service, s.ctx(project, auth), {
+        object_id,
+        artifact_kind: kind,
+        stage_id: stage.id,
+        ...fields,
+      });
+      version_id = String(result_of(added).version_id);
+    } else {
+      object_id = prev.object_id;
+      // A manuscript's footnotes point at positions in its source list, so a
+      // new list replaces the old one; other items accumulate across rounds.
+      if (!replaces_sources) {
+        const old = s.db.all<{ source_version_id: string; quote: string | null; locator: string }>(
+          `SELECT source_version_id, quote, locator FROM citations
+            WHERE project_id = ? AND artifact_version_id = ? ORDER BY citation_no`,
+          project.id,
+          prev.version_id,
+        );
+        for (const c of old) {
+          carried.push({ source_version_id: c.source_version_id, quote: c.quote, locator: parse_json_field(c.locator, {}) });
+        }
+      }
+      const appended = await append_version(s.service, s.ctx(project, auth), {
+        object_id,
+        based_on_version_id: prev.version_id,
+        ...fields,
+      });
+      version_id = String(result_of(appended).version_id);
+      appended_version = true;
+    }
+    // Sources accumulate across rounds (the old merge de-duplicated by URL).
+    const seen = new Set<string>();
+    for (const c of carried) {
+      const row = s.db.get<{ url: string | null }>(
+        "SELECT url FROM source_versions WHERE project_id = ? AND version_id = ?",
+        project.id,
+        c.source_version_id,
+      );
+      if (row?.url) seen.add(row.url);
+      await add_citation(s.service, s.ctx(project, auth), {
+        artifact_version_id: version_id,
+        source_version_id: c.source_version_id,
+        quote: c.quote,
+        locator: c.locator,
+      });
+    }
+    for (const src of Array.isArray(raw.sources) ? raw.sources : []) {
+      if (!is_record(src)) continue;
+      const url = typeof src.url === "string" && src.url.length > 0 ? src.url : null;
+      if (!replaces_sources) {
+        if (url !== null && seen.has(url)) continue;
+        if (url !== null) seen.add(url);
+      }
+      const method = typeof src.method === "string" && SOURCE_METHODS.has(src.method) ? src.method : "unknown";
+      const verified = VERIFIED_METHODS.has(method);
+      const quote = typeof src.quote === "string" && src.quote.length > 0 && verified ? src.quote : null;
+      const made = await create_object(s.service, s.ctx(project, auth), {
+        kind: "source",
+        edition_id: stage.edition_id,
+      });
+      const source_object = String(result_of(made).object_id);
+      const title = typeof src.title === "string" && src.title.length > 0 ? src.title : url ?? "(제목 없음)";
+      const added = await add_source(s.service, s.ctx(project, auth), {
+        object_id: source_object,
+        source_kind: method === "law" ? "law" : method === "kosis" ? "stat" : "web",
+        canonical_locator: url,
+        title,
+        url,
+        locator: source_locator(src),
+        method,
+        verification_state: verified ? "verified" : "unverified",
+        quote,
+      });
+      await add_citation(s.service, s.ctx(project, auth), {
+        artifact_version_id: version_id,
+        source_version_id: String(result_of(added).version_id),
+        quote,
+        locator: {},
+      });
+    }
+    if (appended_version) {
+      // A new version only becomes the item's current one when set here; render,
+      // qa and the next merge all read the current version.
+      await set_current(s.service, s.ctx(project, auth), { object_id, version_id });
+    }
+    merged += 1;
+  }
+  return { merged };
+  });
+};
+
+// qa ---------------------------------------------------------------------
+
+const qa_data: Handler = async (s, req) => {
+  const project = s.project(req.slug);
+  s.auth(project, req.token, null);
+  const stage = s.stage(project, req.args?.stage);
+  const round = s.db.get<{ n: bigint | null }>(
+    "SELECT max(round_no) AS n FROM rounds WHERE project_id = ? AND stage_id = ?",
+    project.id,
+    stage.id,
+  );
+  const items = s.db.all<{
+    object_id: string;
+    display_no: bigint;
+    kind: string;
+    title: string;
+    status: string;
+    summary: string;
+    confidence: string | null;
+    sources: bigint;
+    legacy_id: unknown;
+  }>(
+    `SELECT o.id AS object_id, o.display_no AS display_no, a.kind AS kind, v.title AS title,
+            v.status AS status, v.summary AS summary, v.confidence AS confidence,
+            (SELECT count(*) FROM citations c WHERE c.project_id = v.project_id AND c.artifact_version_id = v.version_id) AS sources,
+            COALESCE(json_extract(v.metadata_json, '$.legacy_id'), json_extract(v.metadata_json, '$.legacy_extra.legacy_id')) AS legacy_id
+       FROM objects o
+       JOIN artifacts a ON a.project_id = o.project_id AND a.object_id = o.id
+       JOIN artifact_versions v ON v.project_id = o.project_id AND v.version_id = o.current_version_id
+      WHERE o.project_id = ? AND a.stage_id = ? AND o.kind = 'artifact'
+        AND a.kind NOT IN ('note', 'review') AND v.status <> 'removed'
+        AND ${not_a_report_sql("v")}
+      ORDER BY o.display_no`,
+    project.id,
+    stage.id,
+  );
+  const notes = s.db.all<{ body_md: string | null }>(
+    `SELECT v.body_md AS body_md
+       FROM artifacts a JOIN artifact_versions v
+         ON v.project_id = a.project_id AND v.object_id = a.object_id
+      WHERE a.project_id = ? AND a.kind = 'note'
+        AND json_extract(v.metadata_json, '$.role') = 'handoff_note'
+      ORDER BY v.rowid DESC LIMIT 5`,
+    project.id,
+  );
+  return {
+    topic: project.topic,
+    stage: stage.key,
+    round_no: round?.n === null || round === undefined ? 0 : display_round_no(s, project.id, stage.id, Number(round.n) + 1) - 1,
+    items: items.map((row) => ({
+      id: typeof row.legacy_id === "bigint" ? Number(row.legacy_id) : (row.legacy_id ?? Number(row.display_no)),
+      kind: row.kind,
+      title: row.title,
+      status: row.status,
+      summary: row.summary,
+      confidence: row.confidence,
+      sources: Number(row.sources),
+    })),
+    notes: notes.map((row) => row.body_md ?? "").reverse(),
+    ...qa_state(s, project, stage),
+  };
+};
+
+/** What the review brief quotes from the state v0.15 kept in project.json: the user's answers, this round's changes and the self-check. */
+function qa_state(s: Session, project: ProjectInfo, stage: StageInfo): Record<string, unknown> {
+  const view = build_project_view(s.db, project.id, s.objects).project as { settings?: unknown; stages?: Record<string, Record<string, unknown>> };
+  const st = view.stages?.[stage.key] ?? {};
+  return { settings: view.settings ?? {}, stage_settings: st.settings ?? {}, review: st.review ?? null, changes: st.changes ?? [] };
+}
+
+const qa_brief: Handler = async (s, req) => {
+  const { project, auth } = await write_auth(s, req);
+  const args = req.args ?? {};
+  const out = await record_qa_brief(s.service, s.ctx(project, auth), {
+    stage: s.stage(project, args.stage).key,
+    text: text_arg(args, "text"),
+  });
+  return { round_no: result_of(out).round_no };
+};
+
+const qa: Handler = async (s, req) => {
+  const { project, auth } = await write_auth(s, req);
+  const args = req.args ?? {};
+  const out = await record_qa(s.service, s.ctx(project, auth), {
+    stage: s.stage(project, args.stage).key,
+    qa: args.qa,
+  });
+  return { round_no: result_of(out).round_no, verdict: result_of(out).verdict };
+};
+
+// lock / unlock -------------------------------------------------------------
+
+const lock: Handler = async (s, req) => {
+  const project = s.project(req.slug);
+  const session = req.session;
+  if (session === undefined || session.length === 0) {
+    throw new Refusal("invalid_payload", "PES_OWNER 환경변수(이 세션 ID)가 필요합니다", 2);
+  }
+  // Checked before anything changes: a refused claim must not leave the
+  // interrupt of the old run behind (the whole handler is one unit as well).
+  if (session.length > SESSION_MAX) {
+    throw new Refusal("invalid_payload", `PES_OWNER 는 ${SESSION_MAX}자 이하여야 합니다`, 2);
+  }
+  const auth = s.auth(project, req.token, "run:claim");
+  const force = req.args?.force === true;
+  const lease = s.lease(project);
+  if (lease !== null) {
+    if (s.is_mine(lease, auth, session)) {
+      await heartbeat(s.service, s.ctx(project, auth), {
+        run_id: lease.run_id,
+        lease_id: lease.lease_id,
+        fence: lease.fence,
+      });
+      return { renewed: true };
+    }
+    if (!force) {
+      throw new Refusal(
+        "locked",
+        `다른 세션이 사용 중: ${Array.from(lease.session ?? "에이전트 run").slice(0, 8).join("")}… ` +
+          `(${local_stamp(lease.acquired_at)}부터, 마지막 기록 ${Math.floor((s.now() - lease.heartbeat_at) / 60_000)}분 전). 그 세션이 끝났으면 --force`,
+        3,
+      );
+    }
+    if (auth.kind !== "human") {
+      throw new Refusal("forbidden", "잠금을 가져오는 --force 는 사람 소유자만 할 수 있습니다");
+    }
+    // The old CLI let --force take anyone's lock: a human owner also takes over
+    // an agent's lease (interrupt ends that run, the claim below is fence + 1).
+    await interrupt(s.service, s.ctx(project, auth), {
+      run_id: lease.run_id,
+      lease_id: lease.lease_id,
+      fence: lease.fence,
+    });
+  }
+  const out = await claim(s.service, s.ctx(project, auth), {
+    mode: "B",
+    runtime: "pes-cli",
+    provider: "local",
+    model: "session-lock",
+    external_session_ref: session,
+  });
+  return { fence: result_of(out).fence, renewed: false };
+};
+
+const unlock: Handler = async (s, req) => {
+  const project = s.project(req.slug);
+  const auth = s.auth(project, req.token, "run:submit");
+  const force = req.args?.force === true;
+  const lease = s.lease(project);
+  if (lease === null) return { released: false };
+  if (!s.is_mine(lease, auth, req.session)) {
+    if (!force) throw new Refusal("locked", "다른 세션의 잠금입니다 (--force 로 해제)", 3);
+    if (auth.kind !== "human") {
+      throw new Refusal("forbidden", "다른 세션의 잠금 해제 --force 는 사람 소유자만 할 수 있습니다");
+    }
+    await interrupt(s.service, s.ctx(project, auth), {
+      run_id: lease.run_id,
+      lease_id: lease.lease_id,
+      fence: lease.fence,
+    });
+    return { released: true };
+  }
+  await complete(s.service, s.ctx(project, auth), {
+    run_id: lease.run_id,
+    lease_id: lease.lease_id,
+    fence: lease.fence,
+    status: "succeeded",
+  });
+  return { released: true };
+};
+
+// context / claim / submit / wait / complete ---------------------------------
+
+const context: Handler = async (s, req) => {
+  const project = s.project(req.slug);
+  // Same auth, scope and data as GET /api/v1/projects/{id}/context (PR13).
+  const secret = randomUUID();
+  const app = new ApiApp({
+    db: s.db,
+    clock: s.clock,
+    objects_dir: s.objects,
+    local_session_secret: secret,
+  });
+  const headers: Record<string, string> =
+    req.token !== undefined && req.token.length > 0
+      ? { authorization: `Bearer ${req.token}` }
+      : { "x-pes-session": secret };
+  const response = await app.handle({
+    method: "GET",
+    path: `/api/v1/projects/${project.id}/context`,
+    headers,
+    body: null,
+  });
+  if (response.status !== 200) {
+    const error = is_record(response.json) && is_record(response.json.error) ? response.json.error : {};
+    throw new Refusal(
+      typeof error.code === "string" ? error.code : "internal_error",
+      typeof error.message === "string" ? error.message : "context 를 읽지 못했습니다",
+    );
+  }
+  const body = response.json as { data: unknown };
+  return body.data;
+};
+
+function guard_of(args: Record<string, unknown>): { run_id: string; lease_id: string; fence: number } {
+  const fence = args.fence;
+  if (typeof fence !== "number" || !Number.isSafeInteger(fence) || fence < 1) {
+    throw new Refusal("invalid_payload", "--fence 는 1 이상의 정수여야 합니다", 2);
+  }
+  return { run_id: text_arg(args, "run_id"), lease_id: text_arg(args, "lease_id"), fence };
+}
+
+const claim_op: Handler = async (s, req) => {
+  const project = s.project(req.slug);
+  const auth = s.auth(project, req.token, "run:claim");
+  const args = req.args ?? {};
+  const payload: Record<string, unknown> =
+    typeof args.run_id === "string" && args.run_id.length > 0
+      ? { run_id: args.run_id }
+      : {
+          mode: args.mode ?? "B",
+          runtime: args.runtime ?? "pes-cli",
+          provider: args.provider ?? "local",
+          model: args.model ?? "unknown",
+        };
+  const out = await claim(s.service, s.ctx(project, auth), payload);
+  return normalize_run_result(result_of(out));
+};
+
+const submit_op: Handler = async (s, req) => {
+  const project = s.project(req.slug);
+  const auth = s.auth(project, req.token, "run:submit");
+  const args = req.args ?? {};
+  const out = await submit_results(s.service, s.ctx(project, auth), { ...guard_of(args), results: args.results });
+  return result_of(out);
+};
+
+const wait_op: Handler = async (s, req) => {
+  const project = s.project(req.slug);
+  const auth = s.auth(project, req.token, "run:submit");
+  const args = req.args ?? {};
+  const payload: Record<string, unknown> = guard_of(args);
+  if (typeof args.reason === "string" && args.reason.length > 0) payload.reason = args.reason;
+  const out = await wait(s.service, s.ctx(project, auth), payload);
+  return normalize_run_result(result_of(out));
+};
+
+const complete_op: Handler = async (s, req) => {
+  const project = s.project(req.slug);
+  const auth = s.auth(project, req.token, "run:submit");
+  const args = req.args ?? {};
+  const payload: Record<string, unknown> = guard_of(args);
+  if (args.status !== undefined) payload.status = args.status;
+  const out = await complete(s.service, s.ctx(project, auth), payload);
+  return normalize_run_result(result_of(out));
+};
+
+/**
+ * A content write is one unit from its lock check on: the implicit lock, the
+ * heartbeat and the command(s) commit together or not at all, so a refused
+ * write leaves no lease behind.
+ */
+// reads: routing, the legacy-shaped view, doctor -------------------------------
+
+/** Which path serves a project: the database only once it is active (PR12 serving_path), else project.json. */
+const route: Handler = async (s, req) => {
+  if (typeof req.slug !== "string" || req.slug.length === 0) {
+    throw new Refusal("invalid_payload", "프로젝트 이름이 필요합니다", 2);
+  }
+  // the hidden owner project (OWNER_STUB_SLUG) is no project of the user: no command serves it
+  const row = req.slug === OWNER_STUB_SLUG ? undefined : s.db.get<{ id: string; topic: string }>("SELECT id, topic FROM projects WHERE slug = ?", req.slug);
+  if (row === undefined) return { serving: "none" };
+  return { serving: serving_path(s.db, row.id) === "database" ? "database" : "legacy", topic: row.topic };
+};
+
+/** The projects the database serves — without the hidden owner project (OWNER_STUB_SLUG): doctor, doctor --fix, list and hub all read this one list. */
+const active_slugs: Handler = async (s) => {
+  const rows = s.db.all<{ slug: string }>("SELECT slug FROM projects WHERE status = 'active' AND slug <> ? ORDER BY slug", OWNER_STUB_SLUG);
+  return { slugs: rows.map((row) => row.slug) };
+};
+
+function served_project(s: Session, req: Request): ProjectInfo {
+  const project = s.project(req.slug);
+  if (project.status !== "active") {
+    throw new Refusal("conflict", `이전이 끝나지 않은 프로젝트입니다: ${project.slug} — project.json 으로 읽습니다`);
+  }
+  s.auth(project, req.token, null);
+  return project;
+}
+
+const read_project: Handler = async (s, req) => {
+  const project = served_project(s, req);
+  const view = build_project_view(s.db, project.id, s.objects);
+  const lease = s.lease(project);
+  const last = s.db.get<{ at: bigint | null }>("SELECT max(created_at) AS at FROM mutation_commits WHERE project_id = ?", project.id);
+  return {
+    project: view.project,
+    pending: view.pending,
+    feedback: view.feedback,
+    lock: lease === null ? null : { owner: lease.session ?? `agent-run:${lease.run_id}`, since: local_stamp(lease.heartbeat_at) },
+    updated: local_stamp(Number(last?.at ?? 0n)),
+    updated_ms: Number(last?.at ?? 0n),
+  };
+};
+
+// reports: new versions of a report / output artifact --------------------------
+
+interface RenderedFile {
+  name: string;
+  media_type: string;
+  bytes: Uint8Array;
+}
+
+/** A rendered file's bytes: UTF-8 with LF line ends on every platform (a CR from any input is not kept). */
+const utf8 = (text: string): Uint8Array => new TextEncoder().encode(text.replace(/\r\n?/g, "\n"));
+
+/** The artifact object of one report role (stage report of a stage, or the project's final output), if it exists. */
+function find_report_object(
+  s: Session,
+  project: ProjectInfo,
+  role: "stage_report" | "final_output",
+  stage: StageInfo | null,
+  edition_id: string,
+): { object_id: string; version_id: string } | undefined {
+  const row = s.db.get<{ object_id: string; version_id: string }>(
+    `SELECT o.id AS object_id, o.current_version_id AS version_id
+       FROM objects o
+       JOIN artifacts a ON a.project_id = o.project_id AND a.object_id = o.id
+       JOIN artifact_versions v ON v.project_id = o.project_id AND v.version_id = o.current_version_id
+      WHERE o.project_id = ? AND o.kind = 'artifact' AND a.kind = ? AND o.edition_id = ?
+        AND ((? IS NULL AND a.stage_id IS NULL) OR a.stage_id = ?)
+        AND json_extract(v.metadata_json, '$.role') = ?
+      ORDER BY o.display_no
+      LIMIT 1`,
+    project.id,
+    role === "stage_report" ? "report" : "output",
+    edition_id,
+    stage === null ? null : stage.id,
+    stage === null ? null : stage.id,
+    role,
+  );
+  return row === undefined ? undefined : { ...row };
+}
+
+/**
+ * The stored file of a report the v0.15 project registered in stages.<stage>.reports, found by its exact registered path
+ * on the current version of the imported report object of that stage (active edition). Only a version with exactly one
+ * rendered, stored file answers; nothing else (no other path, no file on disk) is looked at.
+ */
+function migrated_report_key(s: Session, project: ProjectInfo, stage: StageInfo, path: string): string | null {
+  const rows = s.db.all<{ version_id: string }>(
+    `SELECT o.current_version_id AS version_id
+       FROM objects o
+       JOIN artifacts a ON a.project_id = o.project_id AND a.object_id = o.id
+       JOIN artifact_versions v ON v.project_id = o.project_id AND v.version_id = o.current_version_id
+      WHERE o.project_id = ? AND o.kind = 'artifact' AND a.kind = 'report' AND o.edition_id = ? AND a.stage_id = ?
+        AND json_extract(v.metadata_json, '$.role') IS NULL
+        AND json_extract(v.metadata_json, '$.legacy_extra.report.path') = ?
+      ORDER BY o.display_no`,
+    project.id,
+    stage.edition_id,
+    stage.id,
+    path,
+  );
+  for (const row of rows) {
+    const files = s.db.all<{ storage_key: string | null }>(
+      `SELECT b.storage_key AS storage_key
+         FROM version_files vf JOIN blobs b ON b.project_id = vf.project_id AND b.id = vf.blob_id
+        WHERE vf.project_id = ? AND vf.version_id = ? AND vf.role = 'rendered'`,
+      project.id,
+      row.version_id,
+    );
+    if (files.length === 1 && typeof files[0]!.storage_key === "string") return files[0]!.storage_key;
+  }
+  return null;
+}
+
+/** Current versions of the stage's real items (the same set render seals, minus removed ones). */
+function item_versions(s: Session, project: ProjectInfo, stage: StageInfo): string[] {
+  return s.db
+    .all<{ version_id: string }>(
+      `SELECT o.current_version_id AS version_id
+         FROM objects o
+         JOIN artifacts a ON a.project_id = o.project_id AND a.object_id = o.id
+         JOIN artifact_versions v ON v.project_id = o.project_id AND v.version_id = o.current_version_id
+        WHERE o.project_id = ? AND o.edition_id = ? AND a.stage_id = ? AND o.kind = 'artifact'
+          AND a.kind NOT IN ('note', 'review') AND o.archived_at IS NULL AND v.status <> 'removed'
+          AND ${not_a_report_sql("v")}
+        ORDER BY o.display_no`,
+      project.id,
+      stage.edition_id,
+      stage.id,
+    )
+    .map((row) => row.version_id);
+}
+
+/**
+ * One report run: append a version to the report object (create it the first time), point it at the
+ * item versions it was written from, and attach the rendered files. All in one unit.
+ */
+async function write_report_version(
+  s: Session,
+  project: ProjectInfo,
+  auth: Auth,
+  input: {
+    role: "stage_report" | "final_output";
+    stage: StageInfo | null;
+    edition_id: string;
+    title: string;
+    metadata: Record<string, unknown>;
+    derived_from: string[];
+    files: RenderedFile[];
+  },
+): Promise<Record<string, unknown>> {
+  return s.unit(async () => {
+    const existing = find_report_object(s, project, input.role, input.stage, input.edition_id);
+    const fields = {
+      title: input.title,
+      summary: "",
+      question: null,
+      body_md: null,
+      status: "done",
+      confidence: null,
+      stats: [],
+      conflicts: [],
+      verify: null,
+      // each file's name in this version (the shared blob keeps only its first upload name)
+      metadata: {
+        ...input.metadata,
+        role: input.role,
+        files: input.files.map((file) => ({ name: file.name, sha256: sha256_hex(file.bytes), size: file.bytes.byteLength })),
+      },
+    };
+    let object_id: string;
+    let version_id: string;
+    let version_no: number;
+    if (existing === undefined) {
+      const created = await create_object(s.service, s.ctx(project, auth), { kind: "artifact", edition_id: input.edition_id });
+      object_id = String(result_of(created).object_id);
+      const added = await add_artifact(s.service, s.ctx(project, auth), {
+        object_id,
+        artifact_kind: input.role === "stage_report" ? "report" : "output",
+        stage_id: input.stage === null ? null : input.stage.id,
+        ...fields,
+      });
+      version_id = String(result_of(added).version_id);
+      version_no = Number(result_of(added).version_no);
+    } else {
+      object_id = existing.object_id;
+      const appended = await append_version(s.service, s.ctx(project, auth), {
+        object_id,
+        based_on_version_id: existing.version_id,
+        ...fields,
+      });
+      version_id = String(result_of(appended).version_id);
+      version_no = Number(result_of(appended).version_no);
+      await set_current(s.service, s.ctx(project, auth), { object_id, version_id });
+    }
+    for (const target of input.derived_from) {
+      await link_relation(s.service, s.ctx(project, auth), { from_version_id: version_id, to_version_id: target, kind: "derived_from" });
+    }
+    const stored: Array<{ name: string; blob_id: string }> = [];
+    for (const file of input.files) {
+      const known_before =
+        s.db.get("SELECT 1 AS ok FROM blobs WHERE project_id = ? AND sha256 = ? AND size = ?", project.id, sha256_hex(file.bytes), file.bytes.byteLength) !== undefined;
+      const reserved = result_of(
+        await reserve_upload(s.service, s.ctx(project, auth), {
+          sha256: sha256_hex(file.bytes),
+          size: file.bytes.byteLength,
+          media_type: file.media_type,
+          original_name: file.name,
+        }),
+      );
+      const blob_id = String(reserved.blob_id);
+      if (reserved.state !== "ready") {
+        if (!known_before) s.fresh_files.push({ project_id: project.id, storage_key: `${project.id}/${sha256_hex(file.bytes)}` });
+        await store_blob({ db: s.db, objects_dir: s.objects }, project.id, blob_id, file.bytes);
+        await complete_upload(s.service, { db: s.db, objects_dir: s.objects }, s.ctx(project, auth), { blob_id });
+      }
+      await attach_version(s.service, s.ctx(project, auth), { version_id, blob_id, role: "rendered" });
+      stored.push({ name: file.name, blob_id });
+    }
+    return { object_id, version_id, version_no, files: stored };
+  });
+}
+
+const ATTACHMENT_TYPES: Record<string, string> = {
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  hwpx: "application/hwp+zip",
+  pdf: "application/pdf",
+  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+};
+
+/** The finished files of a stage report (`[{name, bytes_b64}]`): a plain file name with one of the 0.15 suffixes, never one the report renders itself. */
+function report_attachments(value: unknown, rendered: RenderedFile[]): RenderedFile[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw new Refusal("invalid_payload", "보고서 첨부 파일 목록이 올바르지 않습니다", 2);
+  const out: RenderedFile[] = [];
+  for (const entry of value) {
+    const name = is_record(entry) ? entry.name : undefined;
+    const b64 = is_record(entry) ? entry.bytes_b64 : undefined;
+    const ext = typeof name === "string" ? name.slice(name.lastIndexOf(".") + 1).toLowerCase() : "";
+    if (
+      typeof name !== "string" || typeof b64 !== "string" || name.startsWith(".") || /[\\/\u0000]/.test(name) || !name.includes(".") ||
+      ATTACHMENT_TYPES[ext] === undefined || rendered.some((f) => f.name === name) || out.some((f) => f.name === name)
+    ) {
+      throw new Refusal("invalid_payload", "보고서 첨부 파일은 .docx·.hwpx·.pdf·.pptx 파일 이름과 내용이어야 합니다", 2);
+    }
+    out.push({ name, media_type: ATTACHMENT_TYPES[ext] as string, bytes: new Uint8Array(Buffer.from(b64, "base64")) });
+  }
+  return out;
+}
+
+const report: Handler = async (s, req) => {
+  const { project, auth } = await write_auth(s, req);
+  const stage = s.stage(project, req.args?.stage);
+  const view = build_project_view(s.db, project.id, s.objects);
+  const eli5 = is_record(req.args?.eli5) ? (req.args?.eli5 as Dict) : null;
+  const built = local_stamp(s.now());
+  // The report says which version it is, so every run writes distinct bytes (a rerun within the same minute too).
+  const next = s.db.get<{ n: bigint | null }>(
+    `SELECT max(ov.version_no) AS n FROM object_versions ov JOIN artifacts a ON a.project_id = ov.project_id AND a.object_id = ov.object_id
+      WHERE ov.project_id = ? AND a.kind = 'report' AND a.stage_id = ?
+        AND json_extract((SELECT metadata_json FROM artifact_versions av WHERE av.project_id = ov.project_id AND av.version_id = ov.id), '$.role') = 'stage_report'`,
+    project.id,
+    stage.id,
+  );
+  // `plain` (scripts/pes.ts): the report as 0.15 wrote it, without the version line — its files also sit in the project folder
+  const made = stage_report(view.project, stage.key, view.feedback, built, eli5, req.args?.plain === true ? null : Number(next?.n ?? 0n) + 1);
+  const files: RenderedFile[] = [
+    { name: "report.md", media_type: "text/markdown", bytes: utf8(made.markdown) },
+    { name: "report.html", media_type: "text/html", bytes: utf8(made.html) },
+  ];
+  if (made.eli5_html !== null) files.push({ name: "eli5.html", media_type: "text/html", bytes: utf8(made.eli5_html) });
+  // 0.15 registered the Word / HWPX / PDF / slides files a skill put in reports/<stage>/ as stage reports too (pes.py cmd_report):
+  // scripts/pes.ts hands their bytes over and they are attached to the same report version, so the read model lists them.
+  files.push(...report_attachments(req.args?.attachments, files));
+  const out = await write_report_version(s, project, auth, {
+    role: "stage_report",
+    stage,
+    edition_id: stage.edition_id,
+    title: `${REPORT_NAME[stage.key] ?? stage.key}`,
+    metadata: { stage: stage.key, round: (view.project.stages[stage.key] as Dict).round, built },
+    derived_from: item_versions(s, project, stage),
+    files,
+  });
+  const formats = (view.project.settings as Dict | undefined)?.stage_reports;
+  return { ...out, stage: stage.key, name: REPORT_NAME[stage.key], formats: Array.isArray(formats) && formats.length > 0 ? formats : ["md", "html", "eli5"], eli5: made.eli5_html !== null };
+};
+
+/** The bytes of one rendered file (by name) of an output version, or undefined. */
+function rendered_bytes(s: Session, project: ProjectInfo, version_id: string, name: string): Uint8Array | undefined {
+  const row = rendered_files(s.db, project.id, version_id).find((file) => file.name === name);
+  return row === undefined || row.storage_key === null ? undefined : read_storage_bytes(s.objects, project.id, row.storage_key);
+}
+
+async function output_run(s: Session, req: Request, web: boolean): Promise<Record<string, unknown>> {
+  const { project, auth } = await write_auth(s, req);
+  const args = req.args ?? {};
+  const write = s.stage(project, "write");
+  const existing = find_report_object(s, project, "final_output", null, write.edition_id);
+  const assemble_now = !web || existing === undefined || args.assemble === true;
+  const built = local_stamp(s.now());
+  let markdown: Uint8Array;
+  let sources_json: Uint8Array;
+  let sections = 0;
+  let footnotes = 0;
+  let warnings: string[] = [];
+  let derived: string[] = [];
+  if (assemble_now) {
+    const view = build_project_view(s.db, project.id, s.objects);
+    const asm = assemble_manuscript(view.project);
+    markdown = utf8(asm.markdown);
+    sources_json = utf8(JSON.stringify(asm.sources, null, 1));
+    sections = asm.sections;
+    footnotes = asm.footnotes;
+    warnings = asm.warnings;
+    derived = item_versions(s, project, write);
+  } else {
+    const found = existing as { object_id: string; version_id: string };
+    const md = rendered_bytes(s, project, found.version_id, "report.md");
+    const src = rendered_bytes(s, project, found.version_id, "sources.json");
+    if (md === undefined) throw new Refusal("conflict", "조립본(report.md)을 찾을 수 없습니다 — web --assemble 로 다시 조립하세요");
+    markdown = md;
+    sources_json = src ?? utf8("[]");
+    derived = [found.version_id]; // the new version builds on the assembly it reuses
+  }
+  const files: RenderedFile[] = [
+    { name: "report.md", media_type: "text/markdown", bytes: markdown },
+    { name: "sources.json", media_type: "application/json", bytes: sources_json },
+  ];
+  let sources: unknown[] = [];
+  try {
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(sources_json));
+    if (Array.isArray(parsed)) sources = parsed;
+  } catch {
+    sources = [];
+  }
+  if (web) {
+    const html = final_report_html({
+      topic: project.topic,
+      markdown: new TextDecoder().decode(markdown),
+      appendix: typeof args.appendix === "string" ? args.appendix : null,
+      sources,
+      cover: is_record(args.cover) ? (args.cover as Dict) : {},
+      built,
+    });
+    files.push({ name: "report.html", media_type: "text/html", bytes: utf8(html) });
+  }
+  const out = await write_report_version(s, project, auth, {
+    role: "final_output",
+    stage: null,
+    edition_id: write.edition_id,
+    title: "최종 보고서",
+    metadata: { built, assembled: assemble_now, web },
+    derived_from: derived,
+    files,
+  });
+  const verified = sources.filter((x) => is_record(x) && x.verified === true).length;
+  return { ...out, sections, footnotes, warnings, sources: sources.length, verified };
+}
+
+const assemble_op: Handler = (s, req) => output_run(s, req, false);
+const web_op: Handler = (s, req) => output_run(s, req, true);
+
+// screens (stage 2 PR18) ----------------------------------------------------
+
+/** The database change cursor the screens poll: the newest commit of the project. Only a write makes it larger. */
+function change_cursor(s: Session, project: ProjectInfo): number {
+  const row = s.db.get<{ n: bigint | null }>("SELECT max(rowid) AS n FROM mutation_commits WHERE project_id = ?", project.id);
+  return Number(row?.n ?? 0n);
+}
+
+/** Everything the dashboard page embeds that comes from the database (pes.py `build_index`'s data, minus the labels and the ask list). */
+const screen: Handler = async (s, req) => {
+  const project = served_project(s, req);
+  const view = build_project_view(s.db, project.id, s.objects);
+  // Only report links that open: a stage report entry is listed when its path resolves to a stored file (a report this
+  // DB generated, or an imported registered report with its rendered file). Files the import left to be generated again
+  // (md/html/eli5, out/) appear after `pes report`/`pes web` make them.
+  for (const key of STAGE_KEYS) {
+    const st = (view.project.stages as Record<string, Record<string, unknown>> | undefined)?.[key];
+    if (st === undefined || !Array.isArray(st.reports)) continue;
+    st.reports = st.reports.filter((entry: unknown) => {
+      const path = is_record(entry) ? entry.path : undefined;
+      return typeof path === "string" && report_storage_key(s, project, path) !== null;
+    });
+  }
+  const lease = s.lease(project);
+  const last = s.db.get<{ at: bigint | null }>("SELECT max(created_at) AS at FROM mutation_commits WHERE project_id = ?", project.id);
+  return {
+    project: view.project,
+    pending: view.pending,
+    feedback: view.feedback,
+    snapshots: build_snapshots(s.db, project.id, s.objects),
+    outputs: output_names(s.db, project.id).filter((path) => report_storage_key(s, project, path) !== null),
+    runs: s.db
+      .all<{ id: string; status: string; mode: string; runtime: string; model: string; started_at: bigint | null }>(
+        `SELECT id, status, mode, runtime, model, started_at FROM runs
+          WHERE project_id = ? AND status IN ('queued', 'running', 'waiting_human', 'blocked_usage') ORDER BY rowid`,
+        project.id,
+      )
+      .map((row) => ({ id: row.id, status: row.status, mode: row.mode, runtime: row.runtime, model: row.model, started: row.started_at === null ? "" : local_stamp(Number(row.started_at)) })),
+    // U1 follow-up (SEL-97): the same machine value the workspace read sends; the screen words it (켜짐 / 차단 중 / 알 수 없음).
+    ai_connection: { policy: ai_policy_state(s.db, project.id) },
+    dispatches: s.db
+      .all<{ id: string; state: string; provider: string; unknown_reason: string | null }>(
+        `SELECT id, state, provider, unknown_reason FROM outbound_dispatches
+          WHERE project_id = ? AND state IN ('prepared', 'authorized', 'sent', 'unknown', 'blocked') ORDER BY rowid`,
+        project.id,
+      )
+      .map((row) => ({ id: row.id, state: row.state, provider: row.provider, reason: row.unknown_reason ?? "" })),
+    lock: lease === null ? null : { owner: lease.session ?? `agent-run:${lease.run_id}`, since: local_stamp(lease.heartbeat_at) },
+    updated: local_stamp(Number(last?.at ?? 0n)),
+    cursor: change_cursor(s, project),
+  };
+};
+
+/**
+ * The newest question set (form version) of a published form: what the form page of that form key shows now. The local screen sends its
+ * id with the answer; a form revised since is refused. args: form_key, stage (optional).
+ */
+const form_set: Handler = async (s, req) => {
+  const project = served_project(s, req);
+  const key = text_arg(req.args ?? {}, "form_key");
+  const requested = typeof req.args?.stage === "string" && STAGE_KEYS.includes(req.args.stage) ? req.args.stage : undefined;
+  const stage = s.stage(project, requested);
+  const row = s.db.get<{ id: string }>(
+    "SELECT id FROM question_sets WHERE project_id = ? AND stage_id = ? AND form_key = ? ORDER BY version_no DESC LIMIT 1",
+    project.id,
+    stage.id,
+    key,
+  );
+  return { set_id: row === undefined ? null : row.id };
+};
+
+const version: Handler = async (s, req) => {
+  if (req.slug === undefined) {
+    // the home list: any project's change
+    const row = s.db.get<{ n: bigint | null }>("SELECT max(rowid) AS n FROM mutation_commits");
+    return { v: Number(row?.n ?? 0n) };
+  }
+  const project = served_project(s, req);
+  return { v: change_cursor(s, project) };
+};
+
+/**
+ * The stored file behind one report URL path (reports/<stage>/<name> or out/<name>), or null. The screen lists a report
+ * link only when this finds its file, and report_file serves exactly this — so every link the dashboard shows opens.
+ */
+function report_storage_key(s: Session, project: ProjectInfo, path: string): string | null {
+  const parts = path.split("/");
+  if (parts.some((part) => part.length === 0)) return null;
+  if (parts.length === 3 && parts[0] === "reports" && STAGE_KEYS.includes(parts[1] as string)) {
+    const stage = s.stage(project, parts[1]);
+    const found = find_report_object(s, project, "stage_report", stage, stage.edition_id);
+    // a report this DB generated: its current version's files, and only those (the dashboard lists the same set)
+    if (found !== undefined) return rendered_files(s.db, project.id, found.version_id).find((entry) => entry.name === parts[2])?.storage_key ?? null;
+    // no generated report for the stage yet: a report the v0.15 project registered (PR11 import keeps its entry as
+    // metadata.legacy_extra.report and the file as the version's one rendered blob) — the exact registered path only
+    return migrated_report_key(s, project, stage, path);
+  }
+  if (parts.length === 2 && parts[0] === "out" && project.active_edition_id !== null) {
+    const found = find_report_object(s, project, "final_output", null, project.active_edition_id);
+    return found === undefined ? null : (rendered_files(s.db, project.id, found.version_id).find((entry) => entry.name === parts[1])?.storage_key ?? null);
+  }
+  return null;
+}
+
+/** One rendered report file (reports/<stage>/<name> or out/<name>) from the database, base64. */
+const report_file: Handler = async (s, req) => {
+  const project = served_project(s, req);
+  const path = text_arg(req.args ?? {}, "path");
+  const parts = path.split("/");
+  const is_report_path =
+    (parts.length === 3 && parts[0] === "reports" && STAGE_KEYS.includes(parts[1] as string)) ||
+    (parts.length === 2 && parts[0] === "out" && project.active_edition_id !== null);
+  if (!is_report_path) throw new Refusal("not_found", "보고서 경로가 아닙니다");
+  const storage_key = report_storage_key(s, project, path);
+  if (storage_key === null) throw new Refusal("not_found", "보고서 파일이 없습니다");
+  const bytes = read_storage_bytes(s.objects, project.id, storage_key);
+  return { name: parts[parts.length - 1] as string, bytes_b64: Buffer.from(bytes).toString("base64") };
+};
+
+/**
+ * The raw text of received answers by the name `pending` printed (what v0.15 kept in feedback/<name>.json). A screen answer
+ * or an imported one is its raw blob; an answer that came through the API has no raw file, so it is shown as a JSON document
+ * built from its submission row and answer versions (name `submission-<id>.json`, the name `pending` gives it).
+ */
+const answer_texts: Handler = async (s, req) => {
+  const project = served_project(s, req);
+  const raw = (req.args ?? {}).names;
+  if (!Array.isArray(raw) || raw.length < 1 || raw.length > 200 || raw.some((n) => typeof n !== "string" || n.length === 0 || n.length > 200)) {
+    throw new Refusal("invalid_payload", "읽을 답의 이름이 필요합니다", 2);
+  }
+  const answers: Array<{ name: string; text: string }> = [];
+  for (const name of raw as string[]) {
+    const row = s.db.get<{ storage_key: string | null }>(
+      `SELECT b.storage_key AS storage_key FROM submissions s
+         JOIN blobs b ON b.project_id = s.project_id AND b.id = s.raw_blob_id
+        WHERE s.project_id = ? AND b.original_name = ? ORDER BY s.rowid LIMIT 1`,
+      project.id,
+      name,
+    );
+    if (row !== undefined && row.storage_key !== null) {
+      answers.push({ name, text: new TextDecoder().decode(read_storage_bytes(s.objects, project.id, row.storage_key)) });
+      continue;
+    }
+    const bare = name.match(/^submission-(.+)\.json$/);
+    const sub =
+      bare === null
+        ? undefined
+        : s.db.get<{ id: string; set_id: string | null; received_at: bigint; via: string }>(
+            "SELECT id, set_id, received_at, via FROM submissions WHERE project_id = ? AND id = ? AND raw_blob_id IS NULL",
+            project.id,
+            bare[1],
+          );
+    if (sub === undefined) throw new Refusal("not_found", `받은 답이 없습니다: ${name}`, 2);
+    const values = s.db.all<{ question_id: string; state: string; value: string }>(
+      `SELECT av.question_id AS question_id, av.state AS state, av.value AS value
+         FROM answers a JOIN answer_versions av ON av.project_id = a.project_id AND av.object_id = a.object_id
+        WHERE a.project_id = ? AND a.submission_id = ? ORDER BY av.rowid`,
+      project.id,
+      sub.id,
+    );
+    const doc = {
+      submission_id: sub.id,
+      set_id: sub.set_id,
+      via: sub.via,
+      time: local_stamp(Number(sub.received_at)),
+      answers: values.map((v) => ({ question_id: v.question_id, state: v.state, value: parse_json_value(v.value) })),
+    };
+    answers.push({ name, text: JSON.stringify(doc, null, 1) });
+  }
+  return { answers };
+};
+
+function parse_json_value(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+/** The longest form key `pes ask` publishes (canonical: lower-case a-z0-9 and "-", no "-" at either end). */
+const FORM_KEY_MAX = 80;
+/** How much of a screen's raw spec is read to find its canonical form key (longer cannot name a published form). */
+const SPEC_RAW_MAX = 1024;
+
+const WEB_KINDS = new Set(["feedback", "review", "stage_start", "approve", "resume", "reopen"]);
+
+/** `YYYYMMDD-HHMMSS` in local time (what time.strftime("%Y%m%d-%H%M%S") gave the v0.15 answer file). */
+function file_stamp(ms: number): string {
+  const d = new Date(ms);
+  const two = (n: number): string => String(n).padStart(2, "0");
+  return `${d.getFullYear()}${two(d.getMonth() + 1)}${two(d.getDate())}-${two(d.getHours())}${two(d.getMinutes())}${two(d.getSeconds())}`;
+}
+
+/**
+ * An answer the human sent from the local screen. v0.15 wrote feedback/<stage>-R<round>-<time>.json; now that
+ * record is the raw file of one submission (CommandService input.record_chat with `web`), one commit and nothing else on disk.
+ * A form that was revised since the page was opened (its question set is no longer the newest) is refused with `conflict`.
+ */
+const web_feedback: Handler = async (s, req) => {
+  const project = served_project(s, req);
+  const auth = s.auth(project, undefined, null); // the project's human owner; no lease is taken (the screen never blocks on Claude's lock)
+  const args = req.args ?? {};
+  const kind = typeof args.kind === "string" ? args.kind : "feedback";
+  if (!WEB_KINDS.has(kind)) throw new Refusal("invalid_payload", "kind");
+  const requested = typeof args.stage === "string" && STAGE_KEYS.includes(args.stage) ? args.stage : undefined;
+  const stage = s.stage(project, requested);
+  const round = typeof args.round === "number" && Number.isSafeInteger(args.round) ? args.round : 0;
+  const text = typeof args.text === "string" ? args.text.trim() : "";
+  const answers = is_record(args.answers) ? args.answers : {};
+  const raw_spec = typeof args.spec === "string" ? args.spec.slice(0, SPEC_RAW_MAX) : "";
+  const spec = raw_spec.slice(0, FORM_KEY_MAX); // the record keeps v0.15's 80-character spec
+
+  // which question set (form version) this answer belongs to. The form key is the canonical form of the whole spec
+  // (what `pes ask` published, at most FORM_KEY_MAX characters) — never of a cut spec, whose canonical form could be another key.
+  let set_id: string | null = null;
+  const form_key = raw_spec.toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/^-+|-+$/g, "");
+  const checked = kind !== "approve" && kind !== "reopen" && kind !== "feedback";
+  const named_set = typeof args.set_id === "string" && args.set_id.length > 0 ? args.set_id : null;
+  if (checked && form_key.length === 0 && named_set !== null) {
+    // a page that names its form version but no usable form key is not an old unmarked page: the version decides
+    const row = s.db.get<{ id: string }>("SELECT id FROM question_sets WHERE project_id = ? AND stage_id = ? AND id = ?", project.id, stage.id, named_set);
+    if (row === undefined) throw new Refusal("not_found", "질문 폼의 판을 찾을 수 없습니다");
+    set_id = row.id;
+  }
+  if (form_key.length > 0 && checked) {
+    const sets = s.db.all<{ id: string }>(
+      "SELECT id FROM question_sets WHERE project_id = ? AND stage_id = ? AND form_key = ? ORDER BY version_no",
+      project.id,
+      stage.id,
+      form_key,
+    );
+    const named = named_set;
+    if (sets.length === 0 && named !== null) {
+      // the page names a form version, but this form key has none: the form cannot be checked, so the answer is not taken silently
+      throw new Refusal("form_revised", "질문이 바뀌었습니다 — 화면을 새로 불러온 뒤 다시 보내세요");
+    }
+    if (sets.length > 0) {
+      if (named !== null) {
+        if (!sets.some((row) => row.id === named)) throw new Refusal("not_found", "질문 폼의 판을 찾을 수 없습니다");
+        set_id = named;
+      } else if (sets.length > 1) {
+        // a page that does not say which version it showed cannot be tied to one of several
+        throw new Refusal("form_revised", "질문이 바뀌었습니다 — 화면을 새로 불러온 뒤 다시 보내세요");
+      } else {
+        set_id = (sets[0] as { id: string }).id;
+      }
+    }
+  }
+
+  const now = s.now();
+  const stamp = file_stamp(now);
+  const doc: Record<string, unknown> = {
+    stage: stage.key,
+    round,
+    time: stamp,
+    kind,
+    text,
+    answers,
+    spec,
+    via: args.via === "remote" ? "remote" : "html",
+    origin: typeof args.origin === "string" ? args.origin : "",
+    who: typeof args.who === "string" ? args.who : "",
+    id: randomUUID(),
+  };
+  if (set_id !== null) doc.set_id = set_id;
+  const bytes = utf8(JSON.stringify(doc, null, 1));
+  const sha = sha256_hex(bytes);
+  const known = s.db.get("SELECT 1 AS ok FROM blobs WHERE project_id = ? AND sha256 = ? AND size = ?", project.id, sha, bytes.byteLength) !== undefined;
+  if (!known) {
+    s.fresh_files.push({ project_id: project.id, storage_key: `${project.id}/${sha}` });
+    write_storage_bytes(s.objects, project.id, `${project.id}/${sha}`, bytes);
+  }
+  const ctx: MutationContext = { ...s.ctx(project, auth), via: "web", client_request_id: `web-${randomUUID()}` };
+  // The file name is chosen inside the unit (BEGIN IMMEDIATE): concurrent requests in the same second each see the names
+  // the earlier ones committed and take the next -k suffix, so a name clash is never reported as a changed form.
+  const out = await s.unit(async () => {
+    let name = "";
+    for (let k = 1; ; k += 1) {
+      name = `${stage.key}-R${round}-${stamp}${k === 1 ? "" : `-${k}`}.json`;
+      const used =
+        s.db.get("SELECT 1 AS ok FROM blobs WHERE project_id = ? AND original_name = ?", project.id, name) !== undefined ||
+        s.db.get(
+          `SELECT 1 AS ok FROM submissions s JOIN blobs b ON b.project_id = s.project_id AND b.id = s.raw_blob_id
+            WHERE s.project_id = ? AND b.original_name = ?`,
+          project.id,
+          name,
+        ) !== undefined;
+      if (!used) break;
+    }
+    try {
+      const done = await record_chat(s.service, ctx, {
+        stage: stage.key,
+        text: text.length > 0 ? text : JSON.stringify(answers),
+        kind,
+        web: { name, sha256: sha, size: bytes.byteLength, set_id },
+      });
+      return { name, done };
+    } catch (error) {
+      if (error instanceof ApiError && error.code === "conflict" && error.message === FORM_REVISED) {
+        throw new Refusal("form_revised", "질문이 바뀌었습니다 — 화면을 새로 불러온 뒤 다시 보내세요");
+      }
+      throw error;
+    }
+  });
+  // v: the change cursor right after this commit — the screen that sent the answer raises its own baseline to it
+  return { name: out.name, stage: stage.key, submission_id: result_of(out.done).submission_id, set_id, v: change_cursor(s, project) };
+};
+
+function in_unit(handler: Handler): Handler {
+  return (s, req) => s.unit(() => handler(s, req));
+}
+
+/** Operations that only read: they use a read-only connection and change nothing on disk. */
+// migrate (SEL-74 C) -----------------------------------------------------------
+
+/**
+ * What to do after a failed `pes migrate`, one Korean clause per cause (the check of validate, the category of import). It never asks the
+ * user to undo their own edits: a hand-edited report is kept under another name, not thrown away.
+ */
+function migrate_hint(cause: string, path: string | undefined, slug: string): string {
+  const where = path ?? "그 파일";
+  switch (cause) {
+    case "reports_regeneration":
+      return `할 일: 손으로 고친 보고서(${where})를 폴더 밖에 다른 이름으로 보관하고 폴더에서 뺀 뒤 다시 이전하세요 — 이전한 뒤 'pes report ${slug} <단계>' 로 보고서를 새로 만들고, 보관한 내용은 메모로 옮기면 됩니다`;
+    case "source_changed":
+      return "할 일: 이전하는 동안 폴더가 바뀌었습니다 — 이 프로젝트를 쓰는 다른 PES·편집기를 닫고 다시 이전하세요";
+    case "parse_error":
+      return `할 일: ${where} 를 읽지 못했습니다 — 백업 사본으로 바꾸거나 고친 뒤 다시 이전하세요`;
+    case "missing_file":
+    case "files":
+      return `할 일: ${where} 가 없거나 바뀌었습니다 — 그 파일을 제자리에 두고 다시 이전하세요`;
+    default:
+      return "할 일: 폴더는 그대로이니 지우거나 고치지 말고, 이 줄과 'pes doctor' 결과를 개발자에게 알려 주세요";
+  }
+}
+
+/** A refused backup place (assert_backup_location) in one Korean line: why, and how to get out of it. */
+function backup_place_refusal(message: string, backups: string, pes_home: string): Refusal {
+  const why = /OneDrive/i.test(message)
+    ? `백업 폴더(${backups})가 OneDrive 안에 있습니다`
+    : /object store/.test(message)
+      ? `백업 폴더(${backups})가 PES 파일 저장소와 겹칩니다`
+      : `백업 폴더(${backups})와 PES 홈(${pes_home})이 겹칩니다 — 백업은 PES 홈 밖에 있어야 합니다`;
+  return new Refusal("conflict", `이전하지 못했습니다: ${why}. 할 일: PES 홈을 ~/.pes 와 겹치지 않는 폴더(예: ~/pes-projects)로 옮긴 뒤('pes home <새 폴더>') 다시 이전하세요 — 아무것도 바꾸지 않았습니다`);
+}
+
+/** The slug of the project that only holds the local human owner when a fresh database has none (the importer needs a human owner actor). */
+export const OWNER_STUB_SLUG = "pes-local-owner";
+
+/**
+ * Moves one 0.15 project folder into the database: import (PR11) → validate (PR12) → activate with a backup bundle (PR12).
+ * The folder is only read. A failure activates nothing. A project that is already active answers `already`.
+ * args: dir (the folder), pes_home (absolute), slug (the folder's name).
+ */
+const migrate_op: Handler = async (s, req) => {
+  const args = req.args ?? {};
+  const dir = text_arg(args, "dir");
+  const pes_home = text_arg(args, "pes_home");
+  const slug = text_arg(args, "slug");
+  const existing = s.db.get<{ status: string; owner_user_id: string }>("SELECT status, owner_user_id FROM projects WHERE slug = ?", slug);
+  if (existing !== undefined && existing.status === "active") return { state: "already", slug };
+  // the backup goes below ~/.pes/backups: a PES home that holds (or sits inside) that folder cannot be migrated — said before anything is imported
+  const backups = join(pes_dir(s.env), "backups");
+  try {
+    assert_backup_location(backups, pes_home, null);
+  } catch (error) {
+    if (error instanceof ApiError) throw backup_place_refusal(error.message, backups, pes_home);
+    throw error;
+  }
+  // the owner: the one who started this project's earlier try (a retry must stay with the same owner), else the oldest human of this database
+  const human_of = (user_id: string | null): string | undefined =>
+    s.db.get<{ id: string }>(
+      `SELECT a.id AS id FROM actors a JOIN users u ON u.id = a.user_id
+        WHERE a.kind = 'human' AND a.disabled_at IS NULL AND u.disabled_at IS NULL AND (? IS NULL OR a.user_id = ?)
+        ORDER BY a.rowid LIMIT 1`,
+      user_id,
+      user_id,
+    )?.id;
+  let owner_actor_id = human_of(existing === undefined ? null : existing.owner_user_id) ?? human_of(null);
+  if (owner_actor_id === undefined) {
+    await s.unit(async () => {
+      await s.service.execute(s.ctx(null, null), "project.bootstrap", { slug: OWNER_STUB_SLUG, topic: "PES 로컬 소유자 (이전 도구가 만든 자리 — 지우지 마세요)", owner_display_name: "로컬 소유자" });
+    });
+    owner_actor_id = human_of(null);
+  }
+  if (owner_actor_id === undefined) throw new Refusal("unauthenticated", "이 컴퓨터의 사람 소유자를 만들지 못했습니다");
+  const owner = owner_actor_id;
+  try {
+    const imported = await s.unit(() => import_project(s.service, dir, { owner_actor_id: owner }));
+    if (imported.state === "failed") {
+      const first = imported.report.entries[0];
+      throw new Refusal("invalid_payload", `이전하지 못했습니다: 폴더를 옮길 수 없는 내용이 있습니다${first === undefined ? "" : ` (${first.category} ${first.path})`} — 폴더는 그대로 두었습니다. ${migrate_hint(first?.category ?? "", first?.path, slug)}`);
+    }
+    const checked = await s.unit(() => validate_import(s.service, imported.batch_id, { owner_actor_id: owner, source_dir: dir }));
+    if (!checked.ok) {
+      const first = checked.report.problems[0];
+      throw new Refusal("conflict", `이전 검증에 실패했습니다: ${first === undefined ? "차이가 있습니다" : first.check + (first.path === undefined ? "" : " " + first.path)} — 아무것도 켜지 않았고 폴더는 그대로입니다. ${migrate_hint(first?.check ?? "", first?.path, slug)}`);
+    }
+    const backup_dir = join(pes_dir(s.env), "backups", `migrate-${slug}-${imported.batch_id}`);
+    await s.unit(() => activate_import(s.service, imported.batch_id, { owner_actor_id: owner, backup_dir, pes_home }));
+    return { state: "migrated", slug, project_id: imported.project_id, backup_dir };
+  } catch (error) {
+    if (error instanceof ApiError) {
+      if (/backup folder must/.test(error.message)) throw backup_place_refusal(error.message, backups, pes_home);
+      throw new Refusal("conflict", `이전하지 못했습니다: ${error.code} — 아무것도 켜지 않았고 폴더는 그대로입니다. ${migrate_hint(error.code, undefined, slug)}`);
+    }
+    throw error;
+  }
+};
+
+/** Where the web app opens a project (`pes open <slug> --app`): the same rule as GET P/workspace `current` (current_place), read straight from the database. */
+const app_place: Handler = async (s, req) => {
+  const project = served_project(s, req);
+  if (project.active_edition_id === null) throw new Refusal("conflict", `활성 판이 없는 프로젝트입니다: ${project.slug}`);
+  const edition = s.db.get<{ edition_no: bigint; current_stage_id: string | null }>(
+    "SELECT edition_no, current_stage_id FROM editions WHERE project_id = ? AND id = ?",
+    project.id,
+    project.active_edition_id,
+  );
+  if (edition === undefined) throw new Refusal("conflict", `활성 판이 없는 프로젝트입니다: ${project.slug}`);
+  const stages = s.db.all<{ id: string; key: string; status: string }>(
+    "SELECT id, key, status FROM stages WHERE project_id = ? AND edition_id = ? ORDER BY ordinal",
+    project.id,
+    project.active_edition_id,
+  );
+  const rounds = s.db.all<{ stage_id: string; round_no: bigint; state: string }>(
+    "SELECT stage_id, round_no, state FROM rounds WHERE project_id = ? AND edition_id = ? ORDER BY stage_id, round_no",
+    project.id,
+    project.active_edition_id,
+  );
+  const place = current_place(edition.current_stage_id, stages, rounds);
+  if (place === undefined) throw new Refusal("conflict", `단계가 없는 프로젝트입니다: ${project.slug}`);
+  return { id: project.id, edition: Number(edition.edition_no), stage: place.stage.key, round_id: place.round_id };
+};
+
+const READ_ONLY_OPS = new Set(["app_place", "slugs", "active_slugs", "route", "read_project", "screen", "version", "form_set", "report_file", "answer_texts", "live_locks", "overview", "context", "qa-data"]);
+
+const HANDLERS: Record<string, Handler> = {
+  app_place,
+  slugs,
+  active_slugs,
+  form_set,
+  migrate: migrate_op,
+  route,
+  read_project,
+  screen,
+  version,
+  report_file,
+  answer_texts,
+  web_feedback,
+  report: in_unit(report),
+  assemble: in_unit(assemble_op),
+  web: in_unit(web_op),
+  live_locks,
+  overview,
+  init,
+  "round-start": in_unit(round_start),
+  render: in_unit(render),
+  compat_render,
+  compat_approve,
+  compat_reopen,
+  set_field,
+  approve: in_unit(approve),
+  reopen: in_unit(reopen),
+  note: in_unit(note),
+  mark: in_unit(mark),
+  chat: in_unit(chat),
+  "ask-prep": in_unit(ask_prep),
+  ask: in_unit(ask),
+  merge: in_unit(merge),
+  "qa-data": qa_data,
+  "qa-brief": in_unit(qa_brief),
+  qa: in_unit(qa),
+  lock: in_unit(lock),
+  unlock: in_unit(unlock),
+  context,
+  claim: claim_op,
+  submit: submit_op,
+  wait: wait_op,
+  complete: complete_op,
+};
+
+// ---------------------------------------------------------------------------
+// entry
+
+function schema_is_current(db: Db): boolean {
+  try {
+    const migrations = load_migrations();
+    const newest = BigInt(migrations[migrations.length - 1]!.version);
+    const row = db.get<{ schema_version: bigint }>("SELECT schema_version FROM db_meta WHERE id = 1");
+    return row !== undefined && row.schema_version === newest;
+  } catch {
+    return false;
+  }
+}
+
+function empty_file(file: string): boolean {
+  try {
+    return statSync(file).size === 0;
+  } catch {
+    return false;
+  }
+}
+
+/** Whether the database has at least one project row (false when there is no projects table). */
+function holds_projects(db: Db): boolean {
+  try {
+    return db.get<{ one: bigint }>("SELECT 1 AS one FROM projects LIMIT 1") !== undefined;
+  } catch {
+    return false;
+  }
+}
+
+function reply(value: unknown): void {
+  process.stdout.write(`${JSON.stringify(value)}\n`);
+}
+
+/** What one bridge call answers: the JSON line `main` prints, or what `scripts/pes.ts` reads in-process. */
+export type BridgeReply =
+  | { ok: true; data: unknown }
+  | { ok: false; code: string; message: string; exit: number; stack?: string };
+
+export interface BridgeRequest {
+  op: string;
+  slug?: string | null;
+  session?: string | null;
+  token?: string | null;
+  args?: Record<string, unknown> | null;
+}
+
+/**
+ * One request, one reply, no process in between: the body of `main`, shared with scripts/pes.ts (which calls the core in its own
+ * process instead of spawning this file). Nothing is printed here; an unexpected error comes back as `internal_error` with its stack.
+ */
+export async function handle_request(env: Environment, input: BridgeRequest): Promise<BridgeReply> {
+  const request = { ...input } as Request;
+  // Python sends null for "not given".
+  for (const field of ["slug", "session", "token"] as const) {
+    if ((request as unknown as Record<string, unknown>)[field] === null) delete request[field];
+  }
+  if ((request as unknown as { args?: unknown }).args === null) delete request.args;
+  if (request.op === "db_status") {
+    return { ok: true, data: probe_database(db_path(env)) };
+  }
+  const handler = HANDLERS[request.op];
+  if (handler === undefined) {
+    return { ok: false, code: "unknown_command", message: `알 수 없는 작업: ${String(request.op)}`, exit: 1 };
+  }
+  const file = db_path(env);
+  const creating = request.op === "init" || request.op === "migrate";
+  /** What a database that serves nothing answers: a missing file, an empty (0 byte) one, or one without any project (no projects table, an old schema with no project) reads like 0.15 (D14). */
+  const serves_nothing = (): BridgeReply => {
+    if (request.op === "slugs" || request.op === "live_locks" || request.op === "active_slugs") {
+      return { ok: true, data: { slugs: [], locks: {} } };
+    }
+    if (request.op === "route") {
+      return { ok: true, data: { serving: "none" } };
+    }
+    return {
+      ok: false,
+      code: "not_found",
+      message: "PES 데이터베이스가 없습니다 — 옛 project.json 프로젝트는 이전하기 전에는 쓸 수 없습니다",
+      exit: 1,
+    };
+  };
+  if (!creating && (!existsSync(file) || empty_file(file))) return serves_nothing();
+  if (creating) mkdirSync(pes_dir(env), { recursive: true });
+  if (creating && existsSync(file) && !empty_file(file)) {
+    // a SQLite file of something else (tables, no db_meta): migrate would refuse it with an internal error — say it in one line, change nothing
+    const foreign = probe_database(file).foreign === true;
+    if (foreign) return { ok: false, code: "conflict", message: `PES 데이터베이스가 아닌 파일입니다: ${file} — 다른 이름으로 옮겨 둔 뒤 다시 하세요(옛 0.15 폴더는 그대로 읽힙니다)`, exit: 1 };
+  }
+  const read_only = READ_ONLY_OPS.has(request.op);
+  let db: Db;
+  try {
+    db = read_only ? connect_read_only(file) : connect(file);
+  } catch (error) {
+    // a file that is not a database (or a locked / unreadable one) is a refusal with one plain line, not an internal error
+    return { ok: false, code: "database_unreadable", message: `PES 데이터베이스를 열 수 없습니다 — ${error instanceof Error ? error.message.split("\n")[0] : String(error)}`, exit: 1 };
+  }
+  let session: Session | undefined;
+  try {
+    if (creating) migrate(db);
+    else if (!schema_is_current(db)) {
+      // an old schema that holds no project (or no projects table at all) serves nothing: 0.15 folders stay readable; init / migrate bring it up to date
+      if (!holds_projects(db)) return serves_nothing();
+      return { ok: false, code: "schema_not_ready", message: "PES 데이터베이스가 최신이 아닙니다 — pes migrate <프로젝트> 한 번으로 올라갑니다", exit: 1 };
+    }
+    session = new Session(env, db, !read_only);
+    if (typeof request.args?.dir === "string") session.dir_label = request.args.dir;
+    const data = await handler(session, request);
+    return { ok: true, data };
+  } catch (error) {
+    try {
+      session?.discard_fresh_files();
+    } catch {
+      // best effort: the next gc removes an orphan file
+    }
+    if (error instanceof Refusal) {
+      return { ok: false, code: error.code, message: error.message, exit: error.exit };
+    }
+    if (error instanceof ApiError) {
+      return { ok: false, code: error.code, message: `${error.code}: ${error.message}`, exit: 1 };
+    }
+    return { ok: false, code: "internal_error", message: "내부 오류", exit: 1, stack: error instanceof Error ? (error.stack ?? error.message) : String(error) };
+  } finally {
+    db.close();
+  }
+}
+
+async function main(): Promise<void> {
+  let request: BridgeRequest;
+  try {
+    request = JSON.parse(readFileSync(0, "utf8")) as BridgeRequest;
+  } catch {
+    reply({ ok: false, code: "invalid_payload", message: "요청을 읽지 못했습니다", exit: 1 });
+    return;
+  }
+  const answer = await handle_request(process.env as Environment, request);
+  if (!answer.ok && answer.stack !== undefined) {
+    process.stderr.write(`${answer.stack}\n`);
+    const { stack: _stack, ...rest } = answer;
+    reply(rest);
+    return;
+  }
+  reply(answer);
+}
+
+// Only when run as the program (`node cli_bridge.ts`): scripts/pes.ts and scripts/serve.ts import this file for handle_request() and must not start main().
+if (import.meta.main) {
+  main().catch((error: unknown) => {
+    process.stderr.write(`${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`);
+    process.exitCode = 1;
+  });
+}
