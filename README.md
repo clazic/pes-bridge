@@ -64,6 +64,7 @@ irm https://raw.githubusercontent.com/clazic/pes-worker/main/install.ps1 | iex
 | 다시 켜기 | `launchctl kickstart -k gui/$(id -u)/kr.seliq.pes-worker` | `Stop-ScheduledTask "PES Worker"; Start-ScheduledTask "PES Worker"` |
 | 끄기 | `launchctl bootout gui/$(id -u)/kr.seliq.pes-worker` | `Stop-ScheduledTask "PES Worker"` |
 | API 키 다시 넣기 | `sh ~/.pes/worker/worker/tools.sh keys` | `powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\.pes\worker\worker\tools.ps1" keys` |
+| 준비 상태 점검(연결 없이) | `node ~/.pes/worker/worker/worker.mjs --check` | `node "$env:USERPROFILE\.pes\worker\worker\worker.mjs" --check` |
 | 도구 · 키 상태 | `sh ~/.pes/worker/worker/tools.sh check` | `powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\.pes\worker\worker\tools.ps1" check` |
 | 업데이트 | 설치 명령을 다시 실행 | 설치 명령을 다시 실행 |
 | 지우기 | `curl -fsSL https://raw.githubusercontent.com/clazic/pes-worker/main/uninstall.sh \| sh` | `irm https://raw.githubusercontent.com/clazic/pes-worker/main/uninstall.ps1 \| iex` |

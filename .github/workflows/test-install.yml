@@ -15,6 +15,7 @@ jobs:
       - name: 확인
         run: |
           node --check ~/.pes/worker/worker/worker.mjs
+          PATH="$HOME/.pes/runtime/bin:$HOME/.pes/runtime/node/bin:$HOME/.local/bin:$PATH" node ~/.pes/worker/worker/worker.mjs --check
           PATH="$HOME/.pes/runtime/bin:$HOME/.pes/runtime/node/bin:$HOME/.local/bin:$PATH" sh ~/.pes/worker/worker/tools.sh check
   windows:
     runs-on: windows-latest
@@ -38,4 +39,6 @@ jobs:
           $st = powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $w "tools.ps1") check; $st
           if (-not ($st -match "^OK kordoc ")) { Write-Error "kordoc 설치 안 됨"; exit 1 }
           if (-not ($st -match "^OK korean-law ")) { Write-Error "korean-law 설치 안 됨"; exit 1 }
+          & "$env:USERPROFILE\.pes\runtime\node\node.exe" (Join-Path $w "worker.mjs") --check
+          if ($LASTEXITCODE -ne 0) { Write-Error "worker --check 실패"; exit 1 }
           $c = Get-Command claude -ErrorAction SilentlyContinue; if (-not $c) { $p = Join-Path $env:USERPROFILE ".local\bin\claude.exe"; if (-not (Test-Path $p)) { Write-Error "claude 없음"; exit 1 } }

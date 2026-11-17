@@ -316,6 +316,15 @@ async function connect() {
   ws.onclose = (e) => { clearInterval(ping); if (e.code === 1006) lastFail = Date.now(); const wait = Math.min(60_000, 1000 * 2 ** retry++); log(`알림 연결 끊김(${e.code}) — ${Math.round(wait / 1000)}초 뒤 다시`); setTimeout(connect, wait) }
   ws.onerror = () => {}
 }
+// node worker.mjs --check : 연결하지 않고 이 컴퓨터의 준비 상태(claude · 조사 도구 · 키 · ego-browser)만 보이고 끝낸다
+if (process.argv.includes('--check')) {
+  log(`claude: ${which('claude') ?? '없음'} · node ${process.version} · ${process.platform}`)
+  toolsAt = 0
+  const st = (await tools('check', 120_000)).out.split(/\r?\n/).filter(Boolean)
+  for (const l of st) log(`  ${l}`)
+  await egoCheck()
+  process.exit(which('claude') ? 0 : 1)
+}
 void ensureTools(true) // 켤 때 조사 도구 확인 · 설치(알림 연결과 따로)
 void egoCheck() // ego-browser 전용 프로필 확인
 void connect()

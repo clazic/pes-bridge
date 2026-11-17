@@ -57,7 +57,10 @@ Ok $Dest
 Step 2 "기본 도구 (Git · Node.js 26 이상)"
 $nodeCmd = $null
 & $PsExe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Dest "pes-scripts\bootstrap.ps1") | ForEach-Object {
-  $l = "$_"; if ($l -like "NODE *") { $nodeCmd = $l.Substring(5).Trim() } else { Show $l }
+  $l = "$_"
+  if ($l -like "NODE *") { $nodeCmd = $l.Substring(5).Trim() }
+  elseif ($l -like "FAIL node*") { Warn "winget 으로 Node.js 를 설치하지 못했어요 — nodejs.org 공식 파일로 받아요" }
+  else { Show $l }
 }
 Refresh-Path
 # winget 이 없거나 실패하면 nodejs.org 공식 zip 을 받아 %USERPROFILE%\.pes\runtime\node 에 둔다(관리자 권한 없이 · SHA-256 확인)
