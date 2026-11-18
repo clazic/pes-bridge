@@ -83,6 +83,7 @@ EOF
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null || { sleep 2; launchctl bootstrap "gui/$(id -u)" "$PLIST"; }
 echo "  등록했어요: $LABEL"
-[[ -s "$HOME/.config/pes-bridge/key" || -s "$HOME/.config/pes-bridge/token.json" ]] || echo "  곧 브라우저에 PES 「허용」 화면이 열려요 — 허용을 누르면 PES 브리지가 스스로 연결해요."
+[[ -s "$HOME/.config/pes-bridge/key" || -s "$HOME/.config/pes-bridge/token.json" || -n "$(ls "$HOME/.config/pes-bridge/accounts" 2>/dev/null)" ]] || echo "  곧 브라우저에 PES 「허용」 화면이 열려요 — 허용을 누르면 PES 브리지가 스스로 연결해요."
 echo ""
 echo "완료. 로그: tail -f ~/Library/Logs/pes-bridge.log   (「PES 알림에 붙었어요」가 보이면 연결된 거예요)"
+echo "PES 계정을 더 붙이려면: \"$NODE\" \"$HERE/worker.mjs\" --add   (보기 --list · 떼기 --remove <번호>)"

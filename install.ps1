@@ -160,6 +160,7 @@ try {
   Start-Process wscript.exe -ArgumentList "`"$Vbs`""
   Warn "작업 스케줄러에 등록하지 못해 시작프로그램에 넣고 켰어요: $lnk"
 }
-if (-not ((Test-Path "$env:USERPROFILE\.config\pes-bridge\key") -or (Test-Path "$env:USERPROFILE\.config\pes-bridge\token.json"))) { Warn "곧 브라우저에 PES 「허용」 화면이 열려요 — 허용을 누르면 PES 브리지가 스스로 연결해요." }
+if (-not ((Test-Path "$env:USERPROFILE\.config\pes-bridge\key") -or (Test-Path "$env:USERPROFILE\.config\pes-bridge\token.json") -or (Get-ChildItem "$env:USERPROFILE\.config\pes-bridge\accounts" -ErrorAction SilentlyContinue))) { Warn "곧 브라우저에 PES 「허용」 화면이 열려요 — 허용을 누르면 PES 브리지가 스스로 연결해요." }
 Write-Host "`n완료. 로그: Get-Content `"$LogDir\worker.log`" -Wait -Tail 20   (「PES 알림에 붙었어요」가 보이면 연결된 거예요)" -ForegroundColor Cyan
+Write-Host "PES 계정을 더 붙이려면: & `"$Node`" `"$Here\worker.mjs`" --add   (보기 --list · 떼기 --remove <번호>)"
 }

@@ -44,7 +44,7 @@ irm https://raw.githubusercontent.com/clazic/pes-bridge/main/install.ps1 | iex
 ## 처음 한 번 직접 할 일
 
 1. **Claude Code 로그인** — 설치 중 로그인 창이 열리면 로그인합니다. worker 는 이 로그인(내 Claude 구독)으로 일하고, 사용량도 이 계정에서 나갑니다.
-2. **PES 「허용」** — worker 가 처음 켜지면 브라우저에 PES 「허용」 화면이 열립니다. PES 에 로그인한 계정으로 허용을 누르면 끝입니다(토큰은 `~/.config/pes-bridge/token.json` 에 두고 스스로 갱신).
+2. **PES 「허용」** — worker 가 처음 켜지면 브라우저에 PES 「허용」 화면이 열립니다. PES 에 로그인한 계정으로 허용을 누르면 끝입니다(토큰은 `~/.config/pes-bridge/accounts/a1/token.json` 에 두고 스스로 갱신).
 3. **API 키** — 설치 중 단계별로 묻습니다. 발급 페이지를 브라우저로 열어 주고, 키는 화면에 보이지 않게 받아 실제 호출로 확인한 뒤 각 도구 설정에만 저장합니다. 없는 키는 Enter 로 건너뛰고 나중에 넣어도 됩니다.
 4. **ego lite** — 앱의 첫 실행 안내를 끝내고, 로그인하지 않은 새 프로필을 **「PES」** 라는 이름으로 만들어 두면 worker 는 그 프로필로만 원문을 엽니다(로그인된 내 계정이 쓰이지 않게).
 
@@ -55,6 +55,18 @@ irm https://raw.githubusercontent.com/clazic/pes-bridge/main/install.ps1 | iex
 3. 컴퓨터가 **켜져 있고 잠자기 상태가 아니며 사용자로 로그인돼 있어야** 일합니다. 오래 맡길 때는 잠자기를 꺼 두세요(macOS: 시스템 설정 → 배터리 → 전원 어댑터에서 「디스플레이가 꺼졌을 때 자동으로 잠자지 않기」).
 
 같은 PES 계정으로 worker 를 두 대 켜 두면 둘 다 같은 일을 받습니다 — **한 대만** 켜 두세요.
+
+### 한 컴퓨터에 PES 계정 여러 개
+
+브리지 하나가 여러 PES 계정의 일을 함께 받습니다. 계정마다 `~/.config/pes-bridge/accounts/<번호>/` 에 토큰을 따로 두고, 알림 연결 · 실행을 따로 합니다(한 계정이 라운드를 쓰는 동안 다른 계정의 채팅에도 답합니다). 각 계정은 **자기 프로젝트만** 받습니다(관리자 계정도 남의 프로젝트는 받지 않습니다).
+
+```bash
+node ~/.pes/bridge/worker/worker.mjs --add      # 계정 더하기 — 브라우저에서 붙일 계정으로 PES 에 로그인한 뒤 「허용」
+node ~/.pes/bridge/worker/worker.mjs --list     # 붙은 계정 보기
+node ~/.pes/bridge/worker/worker.mjs --remove a2   # 계정 떼기(번호 또는 이메일)
+```
+
+켜져 있는 브리지가 30초 안에 새 계정을 붙이고, 뗀 계정은 연결을 끊습니다. 같은 계정을 두 번 붙이면 하나만 씁니다. 예전 설치의 `~/.config/pes-bridge/token.json` 은 켤 때 첫 계정(`a1`)으로 옮깁니다. Windows 는 `node "%USERPROFILE%\.pes\bridge\worker\worker.mjs" --add`.
 
 ## 관리 명령
 
