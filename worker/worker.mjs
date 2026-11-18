@@ -362,9 +362,11 @@ class Account {
     for (const c of cmds) { bash[c] = 'allow'; bash[`${c} *`] = 'allow' }
     const cfg = join(this.dir, 'opencode.json')
     writeFileSync(cfg, JSON.stringify({ $schema: 'https://opencode.ai/config.json',
-      mcp: { pes: { type: 'remote', url: `${BASE}/mcp`, headers: { Authorization: 'Bearer {env:PES_MCP_TOKEN}' }, enabled: true } },
+      // oauth: false — OpenCode 가 이 서버에 자체 로그인(OAuth)을 시도하지 않고 머리글의 키를 쓰게
+      mcp: { pes: { type: 'remote', url: `${BASE}/mcp`, headers: { Authorization: 'Bearer {env:PES_MCP_TOKEN}' }, oauth: false, enabled: true } },
       permission: { edit: 'deny', webfetch: 'allow', bash } }, null, 2))
-    return runAgent(engine, bin, prompt, ['run', '--format', 'json', '--auto'], { ...opts, env: { ...env, OPENCODE_CONFIG: cfg } })
+    // --standalone: 이미 떠 있는 OpenCode 백그라운드 서비스가 아니라 이 실행만의 서버로 — 그래야 이 계정의 설정(OPENCODE_CONFIG)과 키(PES_MCP_TOKEN)를 읽는다
+    return runAgent(engine, bin, prompt, ['run', '--standalone', '--format', 'json', '--auto'], { ...opts, env: { ...env, OPENCODE_CONFIG: cfg } })
   }
   schedule(why, ms = 2000) { clearTimeout(this.timer); this.timer = setTimeout(() => void this.run(why), ms) }
   async run(why) {

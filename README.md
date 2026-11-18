@@ -64,7 +64,7 @@ irm https://raw.githubusercontent.com/clazic/pes-bridge/main/install.ps1 | iex
 |---|---|---|---|
 | Claude Code | `claude -p` | `--mcp-config`(계정 폴더 `mcp.json`) | 이름으로 묶은 도구만(`--allowedTools`) |
 | Codex | `codex exec --json` | `-c mcp_servers.pes.url=…` + 토큰은 환경 변수 `PES_MCP_TOKEN` | 계정 폴더 · `~/.pes/docs` 만 쓰기, 인터넷 허용, 확인 없이(`approval_policy=never`), 사용자 설정은 읽지 않음 |
-| OpenCode | `opencode run --format json --auto` | 계정 폴더 `opencode.json`(`OPENCODE_CONFIG`, 토큰은 `{env:PES_MCP_TOKEN}`) | 셸은 조사 도구(kosis · vworld · sgis · korean-law · kordoc · ego-browser)만, 파일 고치기 막음 |
+| OpenCode | `opencode run --standalone --format json --auto`(떠 있는 백그라운드 서비스 말고 이 실행만의 서버 — 그래야 계정 설정 · 키를 읽는다) | 계정 폴더 `opencode.json`(`OPENCODE_CONFIG`, 토큰은 `{env:PES_MCP_TOKEN}`, `oauth: false`) | 셸은 조사 도구(kosis · vworld · sgis · korean-law · kordoc · ego-browser)만, 파일 고치기 막음 |
 
 설치 스크립트가 Codex(`@openai/codex`) · OpenCode(`opencode-ai`)를 확인하고 없으면 받습니다 — macOS · Linux 는 `~/.pes/runtime`(npm `--prefix`), Windows 는 npm 전역(`%APPDATA%\npm`). 설치 뒤에 지운 경우에도 그 AI를 고른 계정이 일을 받으면 브리지가 다시 받습니다. **처음 한 번 로그인은 사람이 합니다**: `codex login` · `opencode auth login`. 준비 상태는 `node ~/.pes/bridge/worker/worker.mjs --check` 로 봅니다.
 
