@@ -71,7 +71,7 @@ function migrate() {
 
 // ── PES 로그인 연결(OAuth) — 이 컴퓨터의 브리지를 앱으로 등록하고, 사람이 브라우저에서 「허용」하면 토큰을 dir 에 받는다 ──
 let authing = null
-async function oauthLogin(dir) {
+async function oauthLogin(dir, { open = true } = {}) {
   if (authing) return authing
   authing = (async () => {
     const reg = await fetch(`${BASE}/oauth/register`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ client_name: 'PES 외부 AI', redirect_uris: [REDIRECT] }) }).then((r) => r.json())
@@ -89,7 +89,7 @@ async function oauthLogin(dir) {
       srv.on('error', (e) => reject(new Error(`연결 받을 곳(127.0.0.1:${PORT})을 열지 못했어요: ${e.message}`)))
       const url = `${BASE}/oauth/authorize?` + new URLSearchParams({ response_type: 'code', client_id: reg.client_id, redirect_uri: REDIRECT, code_challenge: challenge, code_challenge_method: 'S256', state, scope: 'pes.read pes.write' })
       log('브라우저에서 붙일 계정으로 PES 에 로그인한 뒤 「허용」을 눌러 주세요:', url)
-      openUrl(url)
+      if (open) openUrl(url); else console.log(`AUTHORIZE_URL ${url}`)
       setTimeout(() => { srv.close(); reject(new Error('10분 안에 허용하지 않았어요')) }, 10 * 60_000)
     })
     const t = await fetch(`${BASE}/oauth/token`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: REDIRECT, client_id: reg.client_id, code_verifier: verifier }) }).then((r) => r.json())
@@ -100,6 +100,8 @@ async function oauthLogin(dir) {
   })().finally(() => { authing = null })
   return authing
 }
+const meFile = (id) => join(ACC, id, 'me.json')
+const savedMe = (id) => readJson(meFile(id))
 /** 이 키가 누구인지(PES GET /mcp/me) — 없으면 null */
 async function whoIs(key) {
   const r = await fetch(`${BASE}/mcp/me`, { headers: { authorization: `Bearer ${key}` } }).catch(() => null)
@@ -350,7 +352,9 @@ class Account {
 }
 
 // ── 계정들 — 켤 때 · 30초마다 계정 폴더를 보고 새 계정은 붙이고, 지운 계정은 뗀다. 같은 사람(PES 사용자 번호)은 한 번만 ──
-const live = new Map()
+// PES 는 한 사람의 외부 AI 연결을 하나만 둔다(새로 「허용」하면 그 사람의 예전 토큰을 끊는다). 그래서 같은 사람의 폴더가 둘이면
+// 살아 있는 토큰 쪽을 쓰고, 끊긴 쪽 폴더는 지운다.
+const live = new Map(), warned = new Set()
 async function sync() {
   const ids = accountIds()
   for (const [id, a] of live) if (!ids.includes(id)) { a.stop(); live.delete(id); log(`[${a.label}] 계정을 뺐어요`) }
@@ -359,11 +363,24 @@ async function sync() {
     const a = new Account(id)
     const key = await a.key()
     const me = key ? await whoIs(key) : null
-    if (me?.email) a.label = me.email
-    if (me?.id != null) {
-      a.uid = me.id
-      const dup = [...live.values()].find((x) => x.uid === me.id)
-      if (dup) { log(`[${id}] ${me.email} 은(는) 이미 ${dup.id} 로 붙어 있어 건너뛰어요 — 필요 없으면 node worker.mjs --remove ${id}`); live.set(id, Object.assign(a, { stopped: true })); continue }
+    if (!me?.id) {
+      // 토큰이 끊겼다 — 같은 사람이 다른 폴더로 다시 붙었으면 이 폴더는 지운다(아니면 다시 붙이라고 알린다)
+      const old = savedMe(id)
+      const twin = old?.id != null && ids.some((x) => x !== id && savedMe(x)?.id === old.id)
+      if (twin) { rmSync(join(ACC, id), { recursive: true, force: true }); log(`[${old.email ?? id}] 끊긴 예전 연결(${id})을 지웠어요 — 같은 계정의 새 연결을 써요`) }
+      else if (!warned.has(id)) { warned.add(id); log(`[${old?.email ?? id}] 연결이 끊겼어요 — 다시 붙이려면: node worker.mjs --add (그 계정으로 「허용」)`) }
+      continue
+    }
+    warned.delete(id)
+    save(meFile(id), { id: me.id, email: me.email })
+    a.label = me.email || id; a.uid = me.id
+    const dup = [...live.values()].find((x) => x.uid === me.id)
+    if (dup) {
+      // 같은 사람이 이미 붙어 있다 — 그쪽 토큰이 끊겼으면 이 폴더로 바꾸고, 살아 있으면 이 폴더를 건너뛴다(30초 뒤 다시 본다)
+      const dk = await dup.key(); const alive = dk ? await whoIs(dk) : null
+      if (alive?.id === me.id) continue
+      dup.stop(); live.delete(dup.id); rmSync(join(ACC, dup.id), { recursive: true, force: true })
+      log(`[${a.label}] 끊긴 연결(${dup.id})을 새 연결(${id})로 바꿨어요`)
     }
     live.set(id, a)
     a.log(`계정 ${id} 을(를) 붙여요`)
@@ -393,14 +410,17 @@ if (process.argv.includes('--list')) {
   process.exit(0)
 }
 // --add : 계정 하나 더 붙이기(브라우저에서 그 계정으로 로그인 → 「허용」). 켜져 있는 브리지가 30초 안에 붙는다
+//   --no-open : 기본 브라우저를 열지 않고 「허용」 주소만 보인다(붙일 계정으로 로그인된 다른 브라우저 · 프로필에서 열 때)
+//   PES 는 한 사람의 연결을 하나만 두므로, 이미 붙은 사람을 다시 「허용」하면 예전 폴더를 지우고 새 토큰으로 바꾼다
 if (process.argv.includes('--add')) {
   migrate()
   const id = nextId(), dir = join(ACC, id)
-  try { await oauthLogin(dir) } catch (e) { log('계정을 붙이지 못했어요:', e.message); try { rmSync(dir, { recursive: true, force: true }) } catch {} ; process.exit(1) }
+  try { await oauthLogin(dir, { open: !process.argv.includes('--no-open') }) } catch (e) { log('계정을 붙이지 못했어요:', e.message); try { rmSync(dir, { recursive: true, force: true }) } catch {} ; process.exit(1) }
   const me = await whoIs(readJson(join(dir, 'token.json'))?.access ?? '')
-  const dup = me?.id != null ? (await Promise.all(accountIds().filter((x) => x !== id).map(async (x) => { const k = await new Account(x).key(); return { x, m: k ? await whoIs(k) : null } }))).find((y) => y.m?.id === me.id) : null
-  if (dup) { rmSync(dir, { recursive: true, force: true }); log(`${me.email} 은(는) 이미 ${dup.x} 로 붙어 있어요 — 새로 붙이지 않았어요. 다른 계정을 붙이려면 브라우저에서 PES 를 그 계정으로 로그인한 뒤 다시 --add`); process.exit(0) }
-  log(`계정 ${id}${me?.email ? ` (${me.email})` : ''} 을(를) 붙였어요 — 켜져 있는 PES 브리지가 30초 안에 알림에 붙어요`)
+  if (me?.id != null) save(meFile(id), { id: me.id, email: me.email })
+  const same = me?.id != null ? accountIds().filter((x) => x !== id && savedMe(x)?.id === me.id) : []
+  for (const x of same) rmSync(join(ACC, x), { recursive: true, force: true })
+  log(same.length ? `${me.email} 은(는) 이미 ${same.join(', ')} 로 붙어 있었어요 — 새 연결(${id})로 바꿨어요(PES 는 한 사람에 연결 하나). 다른 계정을 붙이려면 그 계정으로 로그인된 브라우저에서 「허용」` : `계정 ${id}${me?.email ? ` (${me.email})` : ''} 을(를) 붙였어요 — 켜져 있는 PES 브리지가 30초 안에 알림에 붙어요`)
   process.exit(0)
 }
 // --remove <번호 또는 이메일> : 계정 떼기(토큰 폴더를 지운다. PES 「연결」의 연결 기록은 PES 화면에서 지운다)
