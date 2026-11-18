@@ -3,6 +3,7 @@
 #   Node.js 26 이상   worker 와 조사 도구 설치기(PES setup.ts) · korean-law(npm)가 쓴다. 없으면 nodejs.org 공식 파일을 받아 SHA-256 을 확인한다.
 #   Python 3.10 이상  없으면 uv(astral.sh)로 Python 3.12 를 받는다.
 #   Claude Code CLI   없으면 공식 설치기(claude.ai/install.sh)로 받는다. 처음 한 번 로그인은 사람이 해야 한다.
+#   Codex · OpenCode  없으면 npm 으로 ~/.pes/runtime 에 받는다(@openai/codex · opencode-ai). 로그인은 사람이(codex login · opencode auth login).
 # 이미 있는 것은 그대로 쓴다. 출력: 줄마다 "<OK|INSTALLED|FAIL|USER> <이름> <설명>", 마지막 줄 "PATH <worker 가 쓸 PATH>".
 # 사용: sh worker/bootstrap.sh
 set -u
@@ -55,5 +56,16 @@ else
     echo "USER claude 터미널에서 claude 를 한 번 실행해 로그인해 주세요(worker 가 이 로그인으로 일해요)"
   else echo "FAIL claude Claude Code 를 설치하지 못했어요 — https://claude.com/claude-code"; fi
 fi
+
+# ── Codex CLI · OpenCode (PES 「외부 AI 연결」에서 쓸 AI로 고르면 이것으로 일한다) — 없으면 npm 으로 ~/.pes/runtime 에 받는다 ──
+for E in "codex:@openai/codex:codex login" "opencode:opencode-ai:opencode auth login"; do
+  N=${E%%:*}; R=${E#*:}; PKG=${R%%:*}; LOGIN=${R#*:}
+  if command -v "$N" >/dev/null 2>&1; then echo "OK $N $("$N" --version 2>/dev/null | head -1) ($(command -v "$N"))"
+  elif ! command -v npm >/dev/null 2>&1; then echo "FAIL $N npm 이 없어 받지 못했어요(Node.js 를 먼저 설치해야 해요)"
+  elif npm install -g --prefix "$RT" "$PKG" >/dev/null 2>&1 && command -v "$N" >/dev/null 2>&1; then
+    echo "INSTALLED $N $("$N" --version 2>/dev/null | head -1)"
+    echo "USER $N 이 AI로 일하려면 터미널에서 한 번 로그인해 주세요: $LOGIN"
+  else echo "FAIL $N 설치하지 못했어요 — npm install -g $PKG"; fi
+done
 
 echo "PATH $PATH"

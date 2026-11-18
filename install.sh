@@ -4,7 +4,7 @@
 #
 # 하는 일(다시 실행해도 된다 — 없는 것만 설치하고, worker 파일은 최신판으로 바꾼다)
 #   1. 이 저장소를 ~/.pes/bridge 에 받는다
-#   2. Node.js 26+ · Python 3.10+ · Claude Code 가 없으면 ~/.pes/runtime 에 받는다(sudo · Homebrew 없이, worker/bootstrap.sh)
+#   2. Node.js 26+ · Python 3.10+ · Claude Code · Codex · OpenCode 가 없으면 ~/.pes/runtime 에 받는다(sudo · Homebrew 없이, worker/bootstrap.sh)
 #   3. Claude Code 로그인이 안 돼 있으면 로그인 창을 연다
 #   4. 조사 도구(kosis · vworld · sgis · korean-law · kordoc)를 설치한다(worker/tools.sh)
 #   5. 브라우저 ego lite 가 없으면 설치하고 앱을 연다
@@ -33,7 +33,7 @@ else
 fi
 HERE="$DEST/worker"
 
-echo "[2/7] 실행 환경(Node.js · Python · Claude Code)"
+echo "[2/7] 실행 환경(Node.js · Python · Claude Code · Codex · OpenCode)"
 OUT="$(sh "$HERE/bootstrap.sh")"
 print -r -- "$OUT" | grep -v '^PATH ' | sed 's/^/  /'
 WPATH="$(print -r -- "$OUT" | sed -n 's/^PATH //p')"

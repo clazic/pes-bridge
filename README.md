@@ -56,6 +56,18 @@ irm https://raw.githubusercontent.com/clazic/pes-bridge/main/install.ps1 | iex
 
 같은 PES 계정으로 worker 를 두 대 켜 두면 둘 다 같은 일을 받습니다 — **한 대만** 켜 두세요.
 
+### 쓸 AI 고르기 — Claude Code · Codex · OpenCode
+
+브리지는 계정마다 PES 「외부 AI 연결」 창에서 고른 AI로 일합니다(일을 받을 때마다 PES 에 묻습니다 — 바꾸면 다음 일부터 그 AI).
+
+| AI | 실행 | PES 연결 | 조사 도구 · 권한 |
+|---|---|---|---|
+| Claude Code | `claude -p` | `--mcp-config`(계정 폴더 `mcp.json`) | 이름으로 묶은 도구만(`--allowedTools`) |
+| Codex | `codex exec --json` | `-c mcp_servers.pes.url=…` + 토큰은 환경 변수 `PES_MCP_TOKEN` | 계정 폴더 · `~/.pes/docs` 만 쓰기, 인터넷 허용, 확인 없이(`approval_policy=never`), 사용자 설정은 읽지 않음 |
+| OpenCode | `opencode run --format json --auto` | 계정 폴더 `opencode.json`(`OPENCODE_CONFIG`, 토큰은 `{env:PES_MCP_TOKEN}`) | 셸은 조사 도구(kosis · vworld · sgis · korean-law · kordoc · ego-browser)만, 파일 고치기 막음 |
+
+설치 스크립트가 Codex(`@openai/codex`) · OpenCode(`opencode-ai`)를 확인하고 없으면 받습니다 — macOS · Linux 는 `~/.pes/runtime`(npm `--prefix`), Windows 는 npm 전역(`%APPDATA%\npm`). 설치 뒤에 지운 경우에도 그 AI를 고른 계정이 일을 받으면 브리지가 다시 받습니다. **처음 한 번 로그인은 사람이 합니다**: `codex login` · `opencode auth login`. 준비 상태는 `node ~/.pes/bridge/worker/worker.mjs --check` 로 봅니다.
+
 ### 한 컴퓨터에 PES 계정 여러 개
 
 브리지 하나가 여러 PES 계정의 일을 함께 받습니다. 계정마다 `~/.config/pes-bridge/accounts/<번호>/` 에 토큰을 따로 두고, 알림 연결 · 실행을 따로 합니다(한 계정이 라운드를 쓰는 동안 다른 계정의 채팅에도 답합니다). 각 계정은 **자기 프로젝트만** 받습니다(관리자 계정도 남의 프로젝트는 받지 않습니다).

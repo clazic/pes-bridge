@@ -90,7 +90,7 @@ $Node = (Get-Command node -ErrorAction SilentlyContinue | Select-Object -First 1
 if (-not $Node -or -not (Node-Ok)) { Fail "Node.js 26 이상이 필요해요 — https://nodejs.org 에서 설치한 뒤 새 PowerShell 창에서 다시 실행해 주세요"; Stop-Install; return }
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) { Warn "Git 이 없어요 — Claude Code 가 Git Bash 를 써요. https://git-scm.com/download/win 에서 설치해 주세요" }
 
-Step 3 "Claude Code"
+Step 3 "AI (Claude Code · Codex · OpenCode)"
 $Claude = (Get-Command claude -ErrorAction SilentlyContinue | Select-Object -First 1).Source
 if (-not $Claude) {
   Warn "Claude Code 가 없어 공식 설치기로 받아요 (https://claude.ai/install.ps1)"
@@ -105,6 +105,18 @@ else {
   if ($st -match '"loggedIn":\s*true') { Ok "로그인돼 있어요" }
   elseif ($Interactive) { Warn "로그인 창을 열어요 — 브라우저에서 로그인을 마쳐 주세요(worker 가 이 로그인으로 일해요)"; & $Claude auth login }
   else { Warn "로그인이 필요해요 — PowerShell 에서 claude 를 한 번 실행해 로그인해 주세요" }
+}
+
+# Codex · OpenCode — PES 「외부 AI 연결」에서 쓸 AI로 고르면 이것으로 일한다. 없으면 npm 전역(%APPDATA%\npm)으로 받는다
+foreach ($e in @(@{ n = "codex"; pkg = "@openai/codex"; login = "codex login" }, @{ n = "opencode"; pkg = "opencode-ai"; login = "opencode auth login" })) {
+  $b = (Get-Command $e.n -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+  if ($b) { Ok "$($e.n) $(& $b --version 2>$null | Select-Object -First 1)"; continue }
+  $npm = (Get-Command npm -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+  if (-not $npm) { Warn "$($e.n): npm 이 없어 받지 못했어요"; continue }
+  Warn "$($e.n) 가 없어 받아요 (npm install -g $($e.pkg))"
+  & $npm install -g $e.pkg 2>&1 | Out-Null
+  Refresh-Path
+  if (Get-Command $e.n -ErrorAction SilentlyContinue) { Ok "INSTALLED $($e.n) — 이 AI로 일하려면 PowerShell 에서 한 번 로그인해 주세요: $($e.login)" } else { Fail "$($e.n) 설치하지 못했어요 — npm install -g $($e.pkg)" }
 }
 
 Step 4 "조사 도구 (kosis · vworld · sgis · korean-law · kordoc)"

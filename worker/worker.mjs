@@ -46,6 +46,34 @@ process.env.PATH = [...FIRST, process.env.PATH || (WIN ? '' : '/usr/bin:/bin')].
 const EXTS = WIN ? ['.exe', '.cmd', '.bat', ''] : ['']
 const which = (n) => { for (const d of process.env.PATH.split(SEP)) for (const x of EXTS) { const f = join(d, n + x); try { if (statSync(f).isFile()) return f } catch {} } return null }
 const CLAUDE = process.env.CLAUDE_BIN || which('claude') || (WIN ? 'claude.exe' : '/opt/homebrew/bin/claude')
+// ── 엔진: 계정마다 PES 「외부 AI 연결」에서 고른 AI(GET /mcp/me 의 engine)로 라운드 · 채팅을 돌린다 ──
+//   claude-code: Claude Code(claude -p) · codex: Codex CLI(codex exec) · opencode: OpenCode(opencode run)
+//   Codex · OpenCode 가 없으면 이 컴퓨터의 npm 으로 받는다(macOS · Linux: ~/.pes/runtime, Windows: npm 전역 %APPDATA%\npm). 처음 한 번 로그인은 사람이 한다
+const ENGINE_KO = { 'claude-code': 'Claude Code', codex: 'Codex', opencode: 'OpenCode' }
+const ENGINE_BIN = { 'claude-code': 'claude', codex: 'codex', opencode: 'opencode' }
+const ENGINE_PKG = { codex: '@openai/codex', opencode: 'opencode-ai' }
+const ENGINE_LOGIN = { 'claude-code': 'claude (처음 실행 때 로그인)', codex: 'codex login', opencode: 'opencode auth login' }
+const engineOf = (v) => (ENGINE_BIN[v] ? v : 'claude-code')
+const installing = {}
+/** 엔진 실행 파일 — 없으면 npm 으로 받는다(Claude Code 는 설치 스크립트가 받는다). 못 찾으면 null */
+async function ensureEngine(engine) {
+  const bin = ENGINE_BIN[engine]
+  const have = engine === 'claude-code' ? (process.env.CLAUDE_BIN || which('claude')) : which(bin)
+  if (have) return have
+  const pkg = ENGINE_PKG[engine]
+  if (!pkg) return null
+  installing[engine] ??= (async () => {
+    const npm = which('npm')
+    if (!npm) { log(`${ENGINE_KO[engine]} 가 없는데 npm 도 없어 설치하지 못했어요 — 설치 스크립트를 다시 실행해 주세요`); return null }
+    log(`${ENGINE_KO[engine]} 가 없어 설치해요 (npm ${pkg})`)
+    const args = ['install', '-g', pkg, ...(WIN ? [] : ['--prefix', RT])]
+    const r = await new Promise((res) => execFile(npm, args, { env: process.env, shell: WIN && /\.(cmd|bat)$/i.test(npm), windowsHide: true, timeout: 15 * 60_000, maxBuffer: 8 << 20 }, (e, so, se) => res({ e, se })))
+    const got = which(bin)
+    log(got ? `${ENGINE_KO[engine]} 를 설치했어요 (${got}) — 처음 한 번 터미널에서 로그인해 주세요: ${ENGINE_LOGIN[engine]}` : `${ENGINE_KO[engine]} 를 설치하지 못했어요: ${String(r.e?.message ?? r.se ?? '').trim().split('\n').pop()?.slice(0, 200)}`)
+    return got
+  })().finally(() => { delete installing[engine] })
+  return installing[engine]
+}
 // 브라우저로 주소 열기(PES 「허용」 화면)
 const openUrl = (u) => (WIN ? execFile('rundll32', ['url.dll,FileProtocolHandler', u], () => {}) : execFile(process.platform === 'darwin' ? 'open' : 'xdg-open', [u], () => {}))
 const log = (...a) => console.log(new Date().toISOString(), ...a)
@@ -183,15 +211,53 @@ async function beat(key, b) {
 }
 const slugsOf = (out, ks) => [...new Set(ks.flatMap((k) => (Array.isArray(out?.[k]) ? out[k] : []).map((x) => x.slug)).filter(Boolean))]
 // 프롬프트는 표준 입력으로 넘긴다 — 긴 여러 줄 글을 명령 인자로 넘기면 Windows(특히 .cmd)에서 깨진다
-function runClaude(prompt, args, { key, kind, slugs, label, cwd }) {
+// 엔진마다 JSON 줄 읽기: set(phase, tool) 로 지금 하는 일, fail(사유) 로 오류, done(글) 로 마지막 답
+const READERS = {
+  // Claude Code: --output-format stream-json
+  'claude-code': (m, set, fail, done, label) => {
+    if (m.type === 'stream_event') {
+      const e = m.event
+      if (e?.type === 'content_block_start') { const t = e.content_block?.type; if (t === 'thinking') set('thinking'); else if (t === 'text') set('writing'); else if (t === 'tool_use') set('tool', String(e.content_block.name ?? '').replace(/^mcp__pes__/, '')) }
+    } else if (m.type === 'assistant') {
+      for (const c of m.message?.content ?? []) if (c.type === 'tool_use') log(`  ${label} 도구: ${c.name}${c.input?.command ? ` ${String(c.input.command).slice(0, 80)}` : ''}`)
+    } else if (m.type === 'user') set('thinking')
+    else if (m.type === 'result') { if (m.is_error || m.subtype !== 'success') fail(String(m.result ?? m.subtype ?? '오류')); else done(String(m.result ?? '')) }
+  },
+  // Codex: codex exec --json — turn.* · item.started/completed(agent_message · reasoning · command_execution · mcp_tool_call …)
+  codex: (m, set, fail, done, label) => {
+    const it = m.item ?? {}
+    if (m.type === 'turn.started') set('thinking')
+    else if (m.type === 'item.started' || m.type === 'item.completed') {
+      if (it.type === 'reasoning') set('thinking')
+      else if (it.type === 'agent_message') { set('writing'); if (m.type === 'item.completed' && it.text) done(String(it.text)) }
+      else if (it.type === 'command_execution') { set('tool', 'Bash'); if (m.type === 'item.started') log(`  ${label} 도구: Bash ${String(it.command ?? '').slice(0, 80)}`) }
+      else if (it.type === 'mcp_tool_call') { set('tool', String(it.tool ?? it.name ?? 'mcp')); if (m.type === 'item.started') log(`  ${label} 도구: ${it.server ?? 'mcp'}.${it.tool ?? ''}`) }
+      else if (it.type === 'web_search') set('tool', 'WebSearch')
+      else if (it.type === 'error') fail(String(it.message ?? '오류'))
+    } else if (m.type === 'turn.failed') fail(String(m.error?.message ?? '오류'))
+    else if (m.type === 'error') fail(String(m.message ?? '오류'))
+  },
+  // OpenCode: opencode run --format json — step_start · text · tool_use · step_finish · error
+  opencode: (m, set, fail, done, label) => {
+    const part = m.part ?? {}
+    if (m.type === 'step_start') set('thinking')
+    else if (m.type === 'text') { set('writing'); if (part.text) done(String(part.text)) }
+    else if (m.type === 'tool_use') { const t = String(part.tool ?? 'tool'); set('tool', t.replace(/^pes_/, '')); if (part.state?.status !== 'running') log(`  ${label} 도구: ${t}${part.state?.input?.command ? ` ${String(part.state.input.command).slice(0, 80)}` : ''}`) }
+    else if (m.type === 'error') fail(String(m.error?.data?.message ?? m.error?.message ?? m.error ?? '오류'))
+  },
+}
+function runAgent(engine, bin, prompt, args, { key, kind, slugs, label, cwd, env }) {
   return new Promise((resolve) => {
-    const p = spawn(CLAUDE, ['-p', ...args, ...STREAM], { cwd: cwd ?? DIR, stdio: ['pipe', 'pipe', 'pipe'], env: process.env, windowsHide: true, shell: WIN && /\.(cmd|bat)$/i.test(CLAUDE) })
+    const p = spawn(bin, args, { cwd: cwd ?? DIR, stdio: ['pipe', 'pipe', 'pipe'], env: env ?? process.env, windowsHide: true, shell: WIN && /\.(cmd|bat)$/i.test(bin) })
+    let phase = 'start', tool = null, sent = 0, buf = '', err = null, errTail = '', last = ''
     p.on('error', (e) => { errTail = String(e?.message ?? e) })
     p.stdin.on('error', () => {})
-    let phase = 'start', tool = null, sent = 0, buf = '', err = null, errTail = ''
     p.stdin.end(prompt)
     const send = (force = false) => { if (!force && Date.now() - sent < 2000) return; sent = Date.now(); void beat(key, { slugs, kind, phase, tool }) }
     const set = (ph, t = null) => { if (ph === phase && t === tool) return; phase = ph; tool = t; send() }
+    const fail = (why) => { err = String(why).slice(0, 200) }
+    const done = (text) => { last = text }
+    const read = READERS[engine] ?? READERS['claude-code']
     send(true)
     const tick = setInterval(() => send(true), 10_000)
     p.stdout.on('data', (d) => {
@@ -200,22 +266,14 @@ function runClaude(prompt, args, { key, kind, slugs, label, cwd }) {
       while ((i = buf.indexOf('\n')) >= 0) {
         const line = buf.slice(0, i).replace(/\r$/, ''); buf = buf.slice(i + 1)
         let m; try { m = JSON.parse(line) } catch { continue }
-        if (m.type === 'stream_event') {
-          const e = m.event
-          if (e?.type === 'content_block_start') { const t = e.content_block?.type; if (t === 'thinking') set('thinking'); else if (t === 'text') set('writing'); else if (t === 'tool_use') set('tool', String(e.content_block.name ?? '').replace(/^mcp__pes__/, '')) }
-        } else if (m.type === 'assistant') {
-          for (const c of m.message?.content ?? []) if (c.type === 'tool_use') log(`  ${label} 도구: ${c.name}${c.input?.command ? ` ${String(c.input.command).slice(0, 80)}` : ''}`)
-        } else if (m.type === 'user') set('thinking')
-        else if (m.type === 'result') {
-          if (m.is_error || m.subtype !== 'success') err = String(m.result ?? m.subtype ?? '오류').slice(0, 200)
-          else log(`  ${label} 결과: ${String(m.result ?? '').replace(/\s+/g, ' ').slice(0, 160)}`)
-        }
+        read(m, set, fail, done, label)
       }
     })
     p.stderr.on('data', (d) => { process.stderr.write(d); errTail = (errTail + d).slice(-300) })
     p.on('close', (code) => {
       clearInterval(tick)
-      if (!err && code !== 0) err = (errTail.trim().split('\n').pop() || `claude 가 ${code} 로 끝났어요`).slice(0, 200)
+      if (!err && code !== 0) err = (errTail.trim().split('\n').pop() || `${ENGINE_KO[engine]} 가 ${code} 로 끝났어요`).slice(0, 200)
+      if (!err && last) log(`  ${label} 결과: ${last.replace(/\s+/g, ' ').slice(0, 160)}`)
       phase = err ? 'error' : 'done'; tool = null
       void beat(key, { slugs, kind, phase, ...(err ? { error: err } : {}) })
       log(`${label} 끝(${code})${err ? ` — ${err}` : ''}`)
@@ -225,7 +283,7 @@ function runClaude(prompt, args, { key, kind, slugs, label, cwd }) {
 }
 
 const PROMPT = `너는 PES(정책 연구보고서 작성 서비스)의 PES 브리지가다(사용자에게는 「PES 브리지」이라고 소개한다). pes MCP 도구로 일한다. 사람에게 묻지 않고 끝까지 처리한다.
-1) mcp__pes__pending_work 를 부른다.
+1) pes MCP 의 pending_work 를 부른다.
 2) chats(채팅 물음)는 따로 도는 채팅 담당이 답하니 건너뛴다(도구 결과에 human_chat 이 붙어 와도 마찬가지).
 3) start(시작 질문 차례): get_start_questions → 주제와 앞 단계에 맞게 고른다(근거 없으면 recommended) → answer_start_questions → start_round.
 4) new: start_round. open: 이미 시작한 라운드를 이어 간다.
@@ -236,7 +294,7 @@ const PROMPT = `너는 PES(정책 연구보고서 작성 서비스)의 PES 브�
 
 // 채팅 물음 전용 — 라운드 일과 따로, 바로 답한다(짧은 claude 실행)
 const CHAT_PROMPT = `너는 PES(정책 연구보고서 작성 서비스)의 PES 브리지가고(사용자에게는 「PES 브리지」이라고 소개한다), 지금은 채팅 답만 한다. 라운드 일은 하지 않는다.
-1) mcp__pes__pending_work 를 불러 chats 만 본다.
+1) pes MCP 의 pending_work 를 불러 chats 만 본다.
 2) 물음마다 get_project 로 그 프로젝트를 읽고(진행 방식은 progress · auto_mode 를 보고 그대로 말한다), 필요하면 list_items 로 항목도 읽고, answer_chat {slug, id, text} 로 한국어 3~8줄로 답한다. 인사에는 짧게 인사하고 지금 단계와 다음 할 일을 한 줄로 말한다. 항목은 #번호로 가리킨다.
 3) 같은 사람이 같은 말을 여러 번 보냈으면 마지막 것에만 내용을 담아 답하고, 나머지는 「위에 답했어요」처럼 한 줄로 답해 줄을 비운다.
 규칙: 마크다운 기호를 쓰지 않는다. 모르는 것은 지어내지 않는다.`
@@ -271,6 +329,43 @@ class Account {
     writeFileSync(this.mcpCfg, JSON.stringify({ mcpServers: { pes: { type: 'http', url: `${BASE}/mcp`, headers: { Authorization: `Bearer ${key}` } } } }, null, 2))
     chmodSync(this.mcpCfg, 0o600)
   }
+  /**
+   * 고른 엔진으로 프롬프트를 돌린다 — 엔진은 실행할 때마다 PES(GET /mcp/me)에 묻는다(PES 「외부 AI 연결」에서 바꾸면 다음 일부터 그 엔진)
+   *   claude-code: 도구를 이름으로 묶는다(--allowedTools) · codex: 작업 폴더만 쓰기 + 인터넷 허용, 확인 없이 · opencode: 셸은 조사 도구만, 파일 고치기 막음
+   */
+  async agent(kind, prompt, out, key, why, n) {
+    const me = await whoIs(key)
+    const engine = engineOf(me?.engine)
+    const slugs = slugsOf(out, kind === 'chat' ? ['chats'] : ['start', 'new', 'open', 'review'])
+    const label = `[${this.label}] ${kind === 'chat' ? '채팅 답' : ENGINE_KO[engine]}`
+    const bin = await ensureEngine(engine)
+    if (!bin) { this.log(`${ENGINE_KO[engine]} 를 찾지 못해 실행하지 못했어요`); void beat(key, { slugs, kind, phase: 'error', error: `이 컴퓨터에 ${ENGINE_KO[engine]} 가 없어요 — 설치 스크립트를 다시 실행해 주세요` }); return }
+    this.log(`(${why}) ${kind === 'chat' ? `채팅 물음 ${n}개` : `할 일 ${n}건`} → ${ENGINE_KO[engine]} 시작`)
+    const opts = { key, kind, slugs, label, cwd: this.dir }
+    if (engine === 'claude-code') {
+      this.writeMcp(key)
+      const tools = kind === 'chat' ? ['mcp__pes__pending_work', 'mcp__pes__answer_chat', 'mcp__pes__get_project', 'mcp__pes__list_items', 'mcp__pes__get_item'] : ROUND_TOOLS
+      return runAgent(engine, bin, prompt, ['-p', '--mcp-config', this.mcpCfg, '--strict-mcp-config', '--allowedTools', ...tools, ...(kind === 'chat' ? ['--model', 'sonnet'] : []), ...STREAM], opts)
+    }
+    // 키는 파일에 적지 않고 환경 변수로만 넘긴다
+    const env = { ...process.env, PES_MCP_TOKEN: key }
+    mkdirSync(DOCS_DIR, { recursive: true })
+    if (engine === 'codex') {
+      return runAgent(engine, bin, prompt, ['exec', '--json', '--skip-git-repo-check', '--ignore-user-config', '-s', 'workspace-write',
+        '-c', 'approval_policy="never"', '-c', 'sandbox_workspace_write.network_access=true',
+        '-c', `mcp_servers.pes.url="${BASE}/mcp"`, '-c', 'mcp_servers.pes.bearer_token_env_var="PES_MCP_TOKEN"',
+        '--add-dir', DOCS_DIR, '-C', this.dir, '-'], { ...opts, env })
+    }
+    // OpenCode: 이 계정 폴더의 설정(PES MCP · 권한)을 사용자 설정 위에 얹는다(OPENCODE_CONFIG)
+    const cmds = [...RESEARCH, ...(EGO ? ['ego-browser'] : [])]
+    const bash = { '*': 'deny' }
+    for (const c of cmds) { bash[c] = 'allow'; bash[`${c} *`] = 'allow' }
+    const cfg = join(this.dir, 'opencode.json')
+    writeFileSync(cfg, JSON.stringify({ $schema: 'https://opencode.ai/config.json',
+      mcp: { pes: { type: 'remote', url: `${BASE}/mcp`, headers: { Authorization: 'Bearer {env:PES_MCP_TOKEN}' }, enabled: true } },
+      permission: { edit: 'deny', webfetch: 'allow', bash } }, null, 2))
+    return runAgent(engine, bin, prompt, ['run', '--format', 'json', '--auto'], { ...opts, env: { ...env, OPENCODE_CONFIG: cfg } })
+  }
   schedule(why, ms = 2000) { clearTimeout(this.timer); this.timer = setTimeout(() => void this.run(why), ms) }
   async run(why) {
     if (this.stopped) return
@@ -282,9 +377,7 @@ class Account {
       const n = ['start', 'new', 'open', 'review'].reduce((s, k) => s + (Array.isArray(out?.[k]) ? out[k].length : 0), 0) // 채팅은 runChats 가
       if (!n) { this.log(`(${why}) 라운드 일 없음`); return }
       await ensureTools() // 조사 도구가 빠졌으면 먼저 설치(6시간에 한 번 확인)
-      this.log(`(${why}) 할 일 ${n}건 → claude 시작`)
-      this.writeMcp(key)
-      await runClaude(PROMPT + EGO_RULE() + KORDOC_RULE(), ['--mcp-config', this.mcpCfg, '--strict-mcp-config', '--allowedTools', ...ROUND_TOOLS], { key, kind: 'round', slugs: slugsOf(out, ['start', 'new', 'open', 'review']), label: `[${this.label}] claude`, cwd: this.dir })
+      await this.agent('round', PROMPT + EGO_RULE() + KORDOC_RULE(), out, key, why, n)
     } catch (e) { this.log('오류', e?.message ?? e) } finally {
       this.running = false
       if (this.again) { this.again = false; this.schedule('밀린 알림', 1000) }
@@ -312,9 +405,7 @@ class Account {
       const { out } = await pending(key)
       const n = Array.isArray(out?.chats) ? out.chats.length : 0
       if (!n) return
-      this.log(`(${why}) 채팅 물음 ${n}개 → 답하기`)
-      this.writeMcp(key)
-      await runClaude(CHAT_PROMPT, ['--mcp-config', this.mcpCfg, '--strict-mcp-config', '--allowedTools', 'mcp__pes__pending_work', 'mcp__pes__answer_chat', 'mcp__pes__get_project', 'mcp__pes__list_items', 'mcp__pes__get_item', '--model', 'sonnet'], { key, kind: 'chat', slugs: slugsOf(out, ['chats']), label: `[${this.label}] 채팅 답`, cwd: this.dir })
+      await this.agent('chat', CHAT_PROMPT, out, key, why, n)
     } catch (e) { this.log('채팅 오류', e?.message ?? e) } finally {
       this.chatting = false
       if (this.chatAgain) { this.chatAgain = false; void this.runChats('밀린 채팅') }
@@ -397,6 +488,16 @@ if (process.argv.includes('--check')) {
   const st = (await tools('check', 120_000)).out.split(/\r?\n/).filter(Boolean)
   for (const l of st) log(`  ${l}`)
   await egoCheck()
+  // Codex · OpenCode: 있는지 · 로그인했는지(없으면 실행할 때 npm 으로 받는다)
+  const out = (b, a) => new Promise((res) => execFile(b, a, { timeout: 30_000, shell: WIN && /\.(cmd|bat)$/i.test(b), windowsHide: true }, (e, so, se) => res(`${so ?? ''}${se ?? ''}`.trim())))
+  for (const e of ['codex', 'opencode']) {
+    const b = which(ENGINE_BIN[e])
+    if (!b) { log(`${ENGINE_KO[e]}: 없음 — 이 엔진을 고른 계정이 일을 받으면 npm 으로 설치해요`); continue }
+    const v = (await out(b, ['--version'])).split('\n')[0]
+    const auth = e === 'codex' ? await out(b, ['login', 'status']) : await out(b, ['auth', 'list'])
+    const ok = e === 'codex' ? /logged in/i.test(auth) : /stored|oauth|api/i.test(auth)
+    log(`${ENGINE_KO[e]}: ${b} ${v} · ${ok ? '로그인됨' : `로그인 필요 — ${ENGINE_LOGIN[e]}`}`)
+  }
   migrate()
   log(`계정 ${accountIds().length}개: ${accountIds().join(', ') || '없음'}`)
   process.exit(which('claude') ? 0 : 1)
