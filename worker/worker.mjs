@@ -188,7 +188,10 @@ const EGO_RULE = () => EGO && !egoOff ? `
 const ROUND_TOOLS = ['mcp__pes', 'WebSearch', 'WebFetch', 'Skill', 'Read', ...RESEARCH.map((n) => `Bash(${n}:*)`), ...(EGO ? ['Bash(ego-browser:*)'] : [])]
 
 // 값싼 확인: LLM 없이 pending_work 만 부른다(내 프로젝트만 — 관리자도 all 을 주지 않는다)
+// 먼저 「pes-bridge」로 인사(initialize)해 둔다 — 그래야 마지막에 붙은 AI(예: OpenCode)와 고른 AI가 달라도 이 확인이 막히지 않는다
 async function pending(key) {
+  await fetch(`${BASE}/mcp`, { method: 'POST', headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 0, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'pes-bridge', version: '1' } } }) }).catch(() => {})
   const r = await fetch(`${BASE}/mcp`, {
     method: 'POST',
     headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
