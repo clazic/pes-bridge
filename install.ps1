@@ -1,23 +1,23 @@
-﻿# PES 외부 AI채팅(worker) 원클릭 설치 — Windows (PowerShell)
-#   irm https://raw.githubusercontent.com/clazic/pes-worker/main/install.ps1 | iex
+﻿# PES 브리지(pes-bridge) 원클릭 설치 — Windows (PowerShell)
+#   irm https://raw.githubusercontent.com/clazic/pes-bridge/main/install.ps1 | iex
 #
 # 하는 일(다시 실행해도 된다 — 없는 것만 설치하고, worker 파일은 최신판으로 바꾼다)
-#   1. 이 저장소를 %USERPROFILE%\.pes\worker 에 받는다
+#   1. 이 저장소를 %USERPROFILE%\.pes\bridge 에 받는다
 #   2. Git(Git Bash) · Node.js 26+ 가 없으면 winget 으로 설치한다(pes-scripts\bootstrap.ps1 — clazic/pes 의 것을 그대로 따라 받는다)
 #   3. Claude Code 가 없으면 공식 설치기(https://claude.ai/install.ps1)로 받고, 로그인이 안 돼 있으면 로그인 창을 연다
 #   4. 조사 도구(kosis · vworld · sgis · korean-law · kordoc)를 설치한다(worker\tools.ps1)
 #   5. 브라우저 ego lite 가 없으면 내려받기 페이지를 연다(Windows 는 설치 스크립트가 없다)
 #   6. API 키(KOSIS · VWorld · SGIS · LAW_OC)를 단계별로 묻는다(처음 · 빠진 키가 있을 때)
-#   7. 작업 스케줄러에 「PES Worker」를 등록해 로그인하면 창 없이 켜지게 한다(꺼지면 5초 뒤 다시 켠다)
-# 환경변수: PES_WORKER_REPO(기본 clazic/pes-worker) · PES_WORKER_SRC(받지 않고 이 폴더를 쓴다 — 시험용)
-#           PES_WORKER_TEST=1(시험: 로그인 · 키 · ego lite · 작업 등록을 건너뛴다)
+#   7. 작업 스케줄러에 「PES Bridge」를 등록해 로그인하면 창 없이 켜지게 한다(꺼지면 5초 뒤 다시 켠다)
+# 환경변수: PES_BRIDGE_REPO(기본 clazic/pes-bridge) · PES_BRIDGE_SRC(받지 않고 이 폴더를 쓴다 — 시험용)
+#           PES_BRIDGE_TEST=1(시험: 로그인 · 키 · ego lite · 작업 등록을 건너뛴다)
 $ErrorActionPreference = "Continue"
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$Repo = if ($env:PES_WORKER_REPO) { $env:PES_WORKER_REPO } else { "clazic/pes-worker" }
-$Dest = Join-Path $env:USERPROFILE ".pes\worker"
+$Repo = if ($env:PES_BRIDGE_REPO) { $env:PES_BRIDGE_REPO } else { "clazic/pes-bridge" }
+$Dest = Join-Path $env:USERPROFILE ".pes\bridge"
 $Here = Join-Path $Dest "worker"
-$Test = [bool]$env:PES_WORKER_TEST
+$Test = [bool]$env:PES_BRIDGE_TEST
 $Interactive = (-not $Test) -and (-not $env:CI) -and [Environment]::UserInteractive
 $PsExe = (Get-Process -Id $PID).Path
 function Step($n, $t) { Write-Host "`n[$n/7] $t" -ForegroundColor Cyan }
@@ -35,14 +35,14 @@ function Show($line) {
 }
 
 & {
-Write-Host "PES 외부 AI채팅(worker) 설치 ($Repo)" -ForegroundColor Cyan
+Write-Host "PES 브리지(pes-bridge) 설치 ($Repo)" -ForegroundColor Cyan
 
 Step 1 "worker 받기 → $Dest"
 New-Item -ItemType Directory -Force -Path $Dest | Out-Null
-if ($env:PES_WORKER_SRC) {
-  Copy-Item -Path (Join-Path $env:PES_WORKER_SRC "*") -Destination $Dest -Recurse -Force
+if ($env:PES_BRIDGE_SRC) {
+  Copy-Item -Path (Join-Path $env:PES_BRIDGE_SRC "*") -Destination $Dest -Recurse -Force
 } else {
-  $zip = Join-Path $env:TEMP "pes-worker-$(Get-Random).zip"; $tmp = Join-Path $env:TEMP "pes-worker-$(Get-Random)"
+  $zip = Join-Path $env:TEMP "pes-bridge-$(Get-Random).zip"; $tmp = Join-Path $env:TEMP "pes-bridge-$(Get-Random)"
   try {
     Invoke-WebRequest "https://codeload.github.com/$Repo/zip/refs/heads/main" -OutFile $zip -UseBasicParsing
     Expand-Archive $zip -DestinationPath $tmp -Force
@@ -119,13 +119,19 @@ if ($Interactive) {
   if (-not (Test-Path "$env:USERPROFILE\.pes\worker-keys-asked") -or $missing) { & $PsExe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Here "tools.ps1") keys } else { Ok "모두 등록돼 있어요" }
 } else { Write-Host "  건너뜀 — 나중에: powershell -ExecutionPolicy Bypass -File `"$Here\tools.ps1`" keys" }
 
-Step 7 "자동 실행 (작업 스케줄러 「PES Worker」)"
-# 창 없이 node worker.mjs 를 돌리는 VBScript — 끝나면 5초 뒤 다시 켠다. 로그는 %LOCALAPPDATA%\pes-worker\worker.log
-$LogDir = Join-Path $env:LOCALAPPDATA "pes-worker"; New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+Step 7 "자동 실행 (작업 스케줄러 「PES Bridge」)"
+# 예전 이름(pes-worker · 「PES Worker」)으로 설치돼 있으면 정리한다 — 연결 토큰은 새 폴더로 옮겨 다시 「허용」하지 않아도 되게
+Unregister-ScheduledTask -TaskName "PES Worker" -Confirm:$false -ErrorAction SilentlyContinue
+Remove-Item (Join-Path ([Environment]::GetFolderPath("Startup")) "PES Worker.lnk") -ErrorAction SilentlyContinue
+$OldCfg = Join-Path $env:USERPROFILE ".config\pes-worker"; $NewCfg = Join-Path $env:USERPROFILE ".config\pes-bridge"
+if ((Test-Path $OldCfg) -and -not (Test-Path (Join-Path $NewCfg "token.json")) -and -not (Test-Path (Join-Path $NewCfg "key"))) { New-Item -ItemType Directory -Force -Path $NewCfg | Out-Null; Copy-Item -Path (Join-Path $OldCfg "*") -Destination $NewCfg -Force -ErrorAction SilentlyContinue; Ok "연결 토큰을 새 폴더로 옮겼어요" }
+if (-not $Test) { Remove-Item (Join-Path $env:USERPROFILE ".pes\worker") -Recurse -Force -ErrorAction SilentlyContinue }
+# 창 없이 node worker.mjs 를 돌리는 VBScript — 끝나면 5초 뒤 다시 켠다. 로그는 %LOCALAPPDATA%\pes-bridge\worker.log
+$LogDir = Join-Path $env:LOCALAPPDATA "pes-bridge"; New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $Vbs = Join-Path $Here "run.vbs"
 $cmd = "cmd /c chcp 65001 >nul & `"`"$Node`"`" `"`"$Here\worker.mjs`"`" >> `"`"$LogDir\worker.log`"`" 2>&1"
 $vb = @"
-' PES 외부 AI채팅(worker) — 창 없이 실행하고, 끝나면 5초 뒤 다시 켠다 (install.ps1 이 만든다)
+' PES 브리지(pes-bridge) — 창 없이 실행하고, 끝나면 5초 뒤 다시 켠다 (install.ps1 이 만든다)
 Set sh = CreateObject("WScript.Shell")
 Do
   sh.Run "$cmd", 0, True
@@ -133,8 +139,8 @@ Do
 Loop
 "@
 [IO.File]::WriteAllText($Vbs, $vb, (New-Object Text.UnicodeEncoding($false, $true)))
-if ($Test) { Write-Host "  건너뜀(PES_WORKER_TEST) — $Vbs 만 만들었어요"; Write-Host "`n완료(시험)"; return }
-$Task = "PES Worker"
+if ($Test) { Write-Host "  건너뜀(PES_BRIDGE_TEST) — $Vbs 만 만들었어요"; Write-Host "`n완료(시험)"; return }
+$Task = "PES Bridge"
 Get-CimInstance Win32_Process -Filter "Name='wscript.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like "*pes*run.vbs*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like "*worker.mjs*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 $registered = $false
@@ -143,17 +149,17 @@ try {
   $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
   $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
   $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
-  Register-ScheduledTask -TaskName $Task -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description "PES 외부 AI채팅(worker) — https://github.com/$Repo" -Force -ErrorAction Stop | Out-Null
+  Register-ScheduledTask -TaskName $Task -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description "PES 브리지(pes-bridge) — https://github.com/$Repo" -Force -ErrorAction Stop | Out-Null
   Start-ScheduledTask -TaskName $Task -ErrorAction Stop
   $registered = $true; Ok "작업 스케줄러에 등록하고 켰어요: $Task"
 } catch {
   # 작업 스케줄러를 쓸 수 없으면(회사 정책 등) 시작프로그램 폴더에 넣는다
   $startup = [Environment]::GetFolderPath("Startup")
-  $lnk = Join-Path $startup "PES Worker.lnk"
+  $lnk = Join-Path $startup "PES Bridge.lnk"
   $ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut($lnk); $s.TargetPath = "wscript.exe"; $s.Arguments = "`"$Vbs`""; $s.WorkingDirectory = $Here; $s.Save()
   Start-Process wscript.exe -ArgumentList "`"$Vbs`""
   Warn "작업 스케줄러에 등록하지 못해 시작프로그램에 넣고 켰어요: $lnk"
 }
-if (-not ((Test-Path "$env:USERPROFILE\.config\pes-worker\key") -or (Test-Path "$env:USERPROFILE\.config\pes-worker\token.json"))) { Warn "곧 브라우저에 PES 「허용」 화면이 열려요 — 허용을 누르면 외부 AI채팅이 스스로 연결해요." }
+if (-not ((Test-Path "$env:USERPROFILE\.config\pes-bridge\key") -or (Test-Path "$env:USERPROFILE\.config\pes-bridge\token.json"))) { Warn "곧 브라우저에 PES 「허용」 화면이 열려요 — 허용을 누르면 PES 브리지가 스스로 연결해요." }
 Write-Host "`n완료. 로그: Get-Content `"$LogDir\worker.log`" -Wait -Tail 20   (「PES 알림에 붙었어요」가 보이면 연결된 거예요)" -ForegroundColor Cyan
 }

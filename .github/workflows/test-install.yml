@@ -1,4 +1,4 @@
-# 설치 시험 — macOS · Windows 에서 원클릭 설치를 시험 모드(PES_WORKER_TEST=1: 로그인 · 키 · ego lite · 자동 실행 등록 건너뜀)로 돌린다.
+# 설치 시험 — macOS · Windows 에서 원클릭 설치를 시험 모드(PES_BRIDGE_TEST=1: 로그인 · 키 · ego lite · 자동 실행 등록 건너뜀)로 돌린다.
 name: test install
 on:
   push: { branches: [main] }
@@ -10,20 +10,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: install.sh (시험)
-        env: { PES_WORKER_TEST: "1", PES_WORKER_SRC: "${{ github.workspace }}" }
+        env: { PES_BRIDGE_TEST: "1", PES_BRIDGE_SRC: "${{ github.workspace }}" }
         run: zsh ./install.sh
       - name: 확인
         run: |
-          node --check ~/.pes/worker/worker/worker.mjs
-          PATH="$HOME/.pes/runtime/bin:$HOME/.pes/runtime/node/bin:$HOME/.local/bin:$PATH" node ~/.pes/worker/worker/worker.mjs --check
-          PATH="$HOME/.pes/runtime/bin:$HOME/.pes/runtime/node/bin:$HOME/.local/bin:$PATH" sh ~/.pes/worker/worker/tools.sh check
+          node --check ~/.pes/bridge/worker/worker.mjs
+          PATH="$HOME/.pes/runtime/bin:$HOME/.pes/runtime/node/bin:$HOME/.local/bin:$PATH" node ~/.pes/bridge/worker/worker.mjs --check
+          PATH="$HOME/.pes/runtime/bin:$HOME/.pes/runtime/node/bin:$HOME/.local/bin:$PATH" sh ~/.pes/bridge/worker/tools.sh check
   windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - name: install.ps1 (시험)
         shell: powershell
-        env: { PES_WORKER_TEST: "1", PES_WORKER_SRC: "${{ github.workspace }}" }
+        env: { PES_BRIDGE_TEST: "1", PES_BRIDGE_SRC: "${{ github.workspace }}" }
         run: .\install.ps1
       - name: 설치기 기록
         if: always()
@@ -32,7 +32,7 @@ jobs:
       - name: 확인
         shell: powershell
         run: |
-          $w = Join-Path $env:USERPROFILE ".pes\worker\worker"
+          $w = Join-Path $env:USERPROFILE ".pes\bridge\worker"
           node --check (Join-Path $w "worker.mjs")
           if ($LASTEXITCODE -ne 0) { exit 1 }
           if (-not (Test-Path (Join-Path $w "run.vbs"))) { Write-Error "run.vbs 없음"; exit 1 }

@@ -4,7 +4,7 @@
 #   Python 3.10 이상  없으면 uv(astral.sh)로 Python 3.12 를 받는다.
 #   Claude Code CLI   없으면 공식 설치기(claude.ai/install.sh)로 받는다. 처음 한 번 로그인은 사람이 해야 한다.
 # 이미 있는 것은 그대로 쓴다. 출력: 줄마다 "<OK|INSTALLED|FAIL|USER> <이름> <설명>", 마지막 줄 "PATH <worker 가 쓸 PATH>".
-# 사용: sh scripts/pes-worker/bootstrap.sh
+# 사용: sh worker/bootstrap.sh
 set -u
 RT="$HOME/.pes/runtime"; BIN="$RT/bin"
 mkdir -p "$BIN"

@@ -1,15 +1,15 @@
 #!/usr/bin/env node
-// PES 외부 AI채팅(worker) — 이벤트 기반. 화면 · 사용자에게는 「외부 AI채팅」이라고 부른다.
+// PES 브리지(pes-bridge) — 이벤트 기반. 화면 · 사용자에게는 「PES 브리지」이라고 부른다.
 // PES 서버의 알림 웹소켓(GET /mcp/live, 개인 키)에 붙어 있다가, 「작업 AI = 외부」 프로젝트에 일이 생겼다는 알림
 // (채팅 물음 · 시작 질문 · 점검 · 답 받음 · 새 프로젝트)이 오면 pending_work 를 확인하고, 일이 있으면 Claude Code(claude -p)로 처리한다.
 // 시간마다 돌지 않는다 — 알림이 올 때(그리고 붙을 때 한 번 밀린 일 확인)만 일한다.
 //
 // 키: 처음 한 번 PES 로그인 연결(OAuth · PKCE)로 스스로 받는다 — 브라우저에 PES 「허용」 화면이 열리면 누르기만 하면 된다.
-//      받은 접속 토큰(7일) · 갱신 토큰은 ~/.config/pes-worker/token.json(chmod 600)에 두고, 만료 전에 스스로 갱신한다.
-//      (~/.config/pes-worker/key 에 개인 키를 직접 넣어 둬도 그것을 먼저 쓴다)
+//      받은 접속 토큰(7일) · 갱신 토큰은 ~/.config/pes-bridge/token.json(chmod 600)에 두고, 만료 전에 스스로 갱신한다.
+//      (~/.config/pes-bridge/key 에 개인 키를 직접 넣어 둬도 그것을 먼저 쓴다)
 // 실행: node worker/worker.mjs   (상시 실행: macOS 는 install.sh 가 launchd 에, Windows 는 install.ps1 이 작업 스케줄러에 등록)
-// 로그: macOS ~/Library/Logs/pes-worker.log · Windows %LOCALAPPDATA%\pes-worker\worker.log
-// 배포: https://github.com/clazic/pes-worker (원클릭 설치 · 사용법은 README.md)
+// 로그: macOS ~/Library/Logs/pes-bridge.log · Windows %LOCALAPPDATA%\pes-bridge\worker.log
+// 배포: https://github.com/clazic/pes-bridge (원클릭 설치 · 사용법은 README.md)
 //
 // 조사 도구: PES 서버의 조사 도구는 쓰지 않고, 이 컴퓨터의 kosis · vworld · sgis · korean-law 를 쓴다.
 //   없으면 tools.sh(Windows 는 tools.ps1)로 GitHub clazic 저장소(kosis · vworld · sgis · korean-law-mcp)와 kordoc 을 스스로 설치한다(켤 때 · 6시간마다 확인).
@@ -24,11 +24,11 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const BASE = process.env.PES_BASE || 'https://pes.seliq.kr'
-const DIR = join(homedir(), '.config', 'pes-worker')
+const DIR = join(homedir(), '.config', 'pes-bridge')
 const KEY_FILE = join(DIR, 'key')
 const MCP_CFG = join(DIR, 'mcp.json')
 const TOKEN_FILE = join(DIR, 'token.json')
-const PORT = Number(process.env.PES_WORKER_PORT || 53682)
+const PORT = Number(process.env.PES_BRIDGE_PORT || 53682)
 const REDIRECT = `http://127.0.0.1:${PORT}/callback`
 // 실행 파일을 찾을 곳 — claude 와 조사 도구 모두
 //   macOS · Linux: bootstrap.sh 가 받은 것(~/.pes/runtime) · 사용자 설치(~/.local/bin) · Homebrew
@@ -69,7 +69,7 @@ async function oauthLogin() {
       const srv = createServer((req, res) => {
         const u = new URL(req.url, REDIRECT)
         if (u.pathname !== '/callback') { res.writeHead(404).end(); return }
-        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }).end('<meta charset="utf-8"><p style="font:16px sans-serif;margin:40px">PES 외부 AI채팅을 연결했어요. 이 창은 닫아도 돼요.</p>')
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }).end('<meta charset="utf-8"><p style="font:16px sans-serif;margin:40px">PES 브리지을 연결했어요. 이 창은 닫아도 돼요.</p>')
         srv.close()
         if (u.searchParams.get('state') !== state || !u.searchParams.get('code')) reject(new Error(u.searchParams.get('error_description') || '허용하지 않았거나 응답이 달라요'))
         else resolve(u.searchParams.get('code'))
@@ -223,7 +223,7 @@ function runClaude(prompt, args, { key, kind, slugs, label }) {
   })
 }
 
-const PROMPT = `너는 PES(정책 연구보고서 작성 서비스)의 외부 AI채팅이다(사용자에게는 「외부 AI채팅」이라고 소개한다). pes MCP 도구로 일한다. 사람에게 묻지 않고 끝까지 처리한다.
+const PROMPT = `너는 PES(정책 연구보고서 작성 서비스)의 PES 브리지가다(사용자에게는 「PES 브리지」이라고 소개한다). pes MCP 도구로 일한다. 사람에게 묻지 않고 끝까지 처리한다.
 1) mcp__pes__pending_work 를 부른다.
 2) chats(채팅 물음)는 따로 도는 채팅 담당이 답하니 건너뛴다(도구 결과에 human_chat 이 붙어 와도 마찬가지).
 3) start(시작 질문 차례): get_start_questions → 주제와 앞 단계에 맞게 고른다(근거 없으면 recommended) → answer_start_questions → start_round.
@@ -234,7 +234,7 @@ const PROMPT = `너는 PES(정책 연구보고서 작성 서비스)의 외부 AI
 규칙: 화면에 보이는 글에는 마크다운 기호를 쓰지 않는다. 지어낸 사실 · 수치 · 출처는 쓰지 않는다. 확인하지 못한 것은 「확인하지 못함」.`
 
 // 채팅 물음 전용 — 라운드 일과 따로, 바로 답한다(짧은 claude 실행)
-const CHAT_PROMPT = `너는 PES(정책 연구보고서 작성 서비스)의 외부 AI채팅이고(사용자에게는 「외부 AI채팅」이라고 소개한다), 지금은 채팅 답만 한다. 라운드 일은 하지 않는다.
+const CHAT_PROMPT = `너는 PES(정책 연구보고서 작성 서비스)의 PES 브리지가고(사용자에게는 「PES 브리지」이라고 소개한다), 지금은 채팅 답만 한다. 라운드 일은 하지 않는다.
 1) mcp__pes__pending_work 를 불러 chats 만 본다.
 2) 물음마다 get_project 로 그 프로젝트를 읽고(진행 방식은 progress · auto_mode 를 보고 그대로 말한다), 필요하면 list_items 로 항목도 읽고, answer_chat {slug, id, text} 로 한국어 3~8줄로 답한다. 인사에는 짧게 인사하고 지금 단계와 다음 할 일을 한 줄로 말한다. 항목은 #번호로 가리킨다.
 3) 같은 사람이 같은 말을 여러 번 보냈으면 마지막 것에만 내용을 담아 답하고, 나머지는 「위에 답했어요」처럼 한 줄로 답해 줄을 비운다.
