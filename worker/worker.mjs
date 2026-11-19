@@ -296,11 +296,14 @@ const PROMPT = `너는 PES(정책 연구보고서 작성 서비스)의 PES 브�
 규칙: 화면에 보이는 글에는 마크다운 기호를 쓰지 않는다. 지어낸 사실 · 수치 · 출처는 쓰지 않는다. 확인하지 못한 것은 「확인하지 못함」.`
 
 // 채팅 물음 전용 — 라운드 일과 따로, 바로 답한다(짧은 claude 실행)
-const CHAT_PROMPT = `너는 PES(정책 연구보고서 작성 서비스)의 PES 브리지가고(사용자에게는 「PES 브리지」이라고 소개한다), 지금은 채팅 답만 한다. 라운드 일은 하지 않는다.
+const CHAT_PROMPT = `너는 PES(정책 연구보고서 작성 서비스)의 PES 브리지가고(사용자에게는 「PES 브리지」이라고 소개한다), 지금은 채팅 답(과 사람이 채팅에서 부탁한 항목 고치기)만 한다. 라운드 일은 하지 않는다.
 1) pes MCP 의 pending_work 를 불러 chats 만 본다.
 2) 물음마다 get_project 로 그 프로젝트를 읽고(진행 방식은 progress · auto_mode 를 보고 그대로 말한다), 필요하면 list_items 로 항목도 읽고, answer_chat {slug, id, text} 로 한국어 3~8줄로 답한다. 인사에는 짧게 인사하고 지금 단계와 다음 할 일을 한 줄로 말한다. 항목은 #번호로 가리킨다.
 3) 같은 사람이 같은 말을 여러 번 보냈으면 마지막 것에만 내용을 담아 답하고, 나머지는 「위에 답했어요」처럼 한 줄로 답해 줄을 비운다.
-규칙: 마크다운 기호를 쓰지 않는다. 모르는 것은 지어내지 않는다.`
+4) 내용을 고쳐 달라는 물음(「~로 고쳐 줘」 「~하게 작성해 줘」 「~ 빼 줘」)이면 미루지 말고 바로 고친다 — get_project 로 그 단계 상태를 보고:
+   · 승인 대기(waiting)면: get_item 으로 해당 항목을 읽고 update_item {slug, stage, id, title/summary/details, note} 로 그 자리에서 고친다(요청한 곳만, 나머지 글 · 표 · 출처 표시는 그대로). 고칠 항목이 여럿이면 모두 고친다. 그다음 answer_chat 으로 「n번을 이렇게 고쳤어요」처럼 고친 항목 번호와 바뀐 점을 답한다. 「다음 라운드에 반영하겠다」 「채팅에서는 답만 할 수 있다」고 하지 않는다.
+   · 작업 중(working)이면: 고치지 않고 지금 라운드가 끝나면 반영된다고 답한다. 완료(approved)면: 그 단계를 「다시 열기」해야 고칠 수 있다고 답한다.
+규칙: 마크다운 기호를 쓰지 않는다. 모르는 것은 지어내지 않는다. 단계 상태는 홈 화면 이름(예정 · 답변 대기 · 작업 중 · 승인 대기 · 완료)으로 말하고 「사람 차례」라고 하지 않는다.`
 /**
  * 계정 하나 — 토큰 · MCP 설정 · 알림 연결 · 라운드 · 채팅 실행 상태를 계정마다 따로 가진다.
  * 계정끼리는 따로 돈다(한 계정이 라운드를 쓰는 동안 다른 계정의 채팅에도 답한다).
@@ -347,7 +350,7 @@ class Account {
     const opts = { key, kind, slugs, label, cwd: this.dir }
     if (engine === 'claude-code') {
       this.writeMcp(key)
-      const tools = kind === 'chat' ? ['mcp__pes__pending_work', 'mcp__pes__answer_chat', 'mcp__pes__get_project', 'mcp__pes__list_items', 'mcp__pes__get_item'] : ROUND_TOOLS
+      const tools = kind === 'chat' ? ['mcp__pes__pending_work', 'mcp__pes__answer_chat', 'mcp__pes__get_project', 'mcp__pes__list_items', 'mcp__pes__get_item', 'mcp__pes__update_item'] : ROUND_TOOLS
       return runAgent(engine, bin, prompt, ['-p', '--mcp-config', this.mcpCfg, '--strict-mcp-config', '--allowedTools', ...tools, ...(kind === 'chat' ? ['--model', 'sonnet'] : []), ...STREAM], opts)
     }
     // 키는 파일에 적지 않고 환경 변수로만 넘긴다
