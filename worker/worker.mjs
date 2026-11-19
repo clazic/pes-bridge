@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // PES 브리지(pes-bridge) — 이벤트 기반. 화면 · 사용자에게는 「PES 브리지」이라고 부른다.
 // PES 서버의 알림 웹소켓(GET /mcp/live, 개인 키)에 붙어 있다가, 「작업 AI = 외부」 프로젝트에 일이 생겼다는 알림
-// (채팅 물음 · 시작 질문 · 점검 · 답 받음 · 새 프로젝트)이 오면 pending_work 를 확인하고, 일이 있으면 Claude Code(claude -p)로 처리한다.
+// (채팅 물음 · 시작 질문 · 점검 · 답 받음 · 새 프로젝트 · 한글로 열기 다듬기)이 오면 pending_work 를 확인하고, 일이 있으면 Claude Code(claude -p)로 처리한다.
 // 시간마다 돌지 않는다 — 알림이 올 때(그리고 붙을 때 한 번 밀린 일 확인)만 일한다.
 //
 // 계정: 한 컴퓨터에 PES 계정을 여러 개 붙일 수 있다. 계정마다 ~/.config/pes-bridge/accounts/<번호>/ 에 토큰을 두고,
@@ -199,7 +199,7 @@ async function pending(key) {
   })
   const j = await r.json().catch(() => null)
   const out = j?.result?.structuredContent ?? JSON.parse(j?.result?.content?.[0]?.text ?? '{}')
-  const n = ['chats', 'start', 'new', 'open', 'review'].reduce((s, k) => s + (Array.isArray(out?.[k]) ? out[k].length : 0), 0)
+  const n = ['chats', 'start', 'new', 'open', 'review', 'polish'].reduce((s, k) => s + (Array.isArray(out?.[k]) ? out[k].length : 0), 0)
   return { n, out }
 }
 
@@ -304,6 +304,13 @@ const CHAT_PROMPT = `너는 PES(정책 연구보고서 작성 서비스)의 PES 
    · 승인 대기(waiting)면: get_item 으로 해당 항목을 읽고 update_item {slug, stage, id, title/summary/details, note} 로 그 자리에서 고친다(요청한 곳만, 나머지 글 · 표 · 출처 표시는 그대로). 고칠 항목이 여럿이면 모두 고친다. 그다음 answer_chat 으로 「n번을 이렇게 고쳤어요」처럼 고친 항목 번호와 바뀐 점을 답한다. 「다음 라운드에 반영하겠다」 「채팅에서는 답만 할 수 있다」고 하지 않는다.
    · 작업 중(working)이면: 고치지 않고 지금 라운드가 끝나면 반영된다고 답한다. 완료(approved)면: 그 단계를 「다시 열기」해야 고칠 수 있다고 답한다.
 규칙: 마크다운 기호를 쓰지 않는다. 모르는 것은 지어내지 않는다. 단계 상태는 홈 화면 이름(예정 · 답변 대기 · 작업 중 · 승인 대기 · 완료)으로 말하고 「사람 차례」라고 하지 않는다.`
+// 「한글로 열기」 보고서 스킬대로 다듬기 전용(pending_work 의 polish) — 라운드 · 채팅과 따로, 빠른 모델로
+const POLISH_PROMPT = `너는 PES(정책 연구보고서 작성 서비스)의 PES 브리지다. 지금은 「한글로 열기」의 보고서 스킬대로 다듬기만 한다. 라운드 일 · 채팅 답은 하지 않는다. 사람에게 묻지 않고 끝까지 처리한다.
+1) pes MCP 의 pending_work 를 불러 polish 만 본다(프로젝트 slug 마다 조각이 있다).
+2) get_polish {slug, max: 6} 으로 조각을 받는다. rules(다듬기 규칙)와 skill(그 사람의 보고서 작성 스킬 — 공통 · 보고서 종류 · 내 문체)을 따른다.
+3) 조각마다 다듬은 글을 submit_polish {slug, id, text} 로 낸다. 자리표(⟪K0⟫ 같은 것) · 각주 표시(⟦3⟧ · [^3]) · 수치 · 단위 · 날짜는 하나도 바꾸거나 빼거나 옮기지 않는다. 문단 순서와 개수를 지킨다. 받지 못했다는 오류가 오면 그 까닭대로 고쳐 다시 낸다 — 두 번 해도 안 되면 받은 글을 그대로 낸다.
+4) 그 프로젝트에 남은 조각이 없을 때까지 2~3을 되풀이한다. 다른 slug 도 같은 방법으로 한다. 마지막에 pending_work 를 다시 불러 polish 가 비었으면 끝낸다.
+규칙: 사실 · 수치 · 판단의 뜻은 바꾸지 않는다(문장 끝 · 기호 · 낱말 · 「」 묶기 · 띄어쓰기만). 설명 · 인사 없이 도구로만 일한다.`
 /**
  * 계정 하나 — 토큰 · MCP 설정 · 알림 연결 · 라운드 · 채팅 실행 상태를 계정마다 따로 가진다.
  * 계정끼리는 따로 돈다(한 계정이 라운드를 쓰는 동안 다른 계정의 채팅에도 답한다).
@@ -314,6 +321,7 @@ class Account {
     this.tokenFile = join(this.dir, 'token.json'); this.keyFile = join(this.dir, 'key'); this.mcpCfg = join(this.dir, 'mcp.json')
     this.running = false; this.again = false; this.timer = null
     this.chatting = false; this.chatAgain = false; this.chatTries = 0; this.chatRetry = null
+    this.polishing = false; this.polishAgain = false
     this.retry = 0; this.lastFail = 0; this.ws = null; this.ping = null; this.stopped = false
   }
   log(...a) { log(`[${this.label}]`, ...a) }
@@ -342,16 +350,16 @@ class Account {
   async agent(kind, prompt, out, key, why, n) {
     const me = await whoIs(key)
     const engine = engineOf(me?.engine)
-    const slugs = slugsOf(out, kind === 'chat' ? ['chats'] : ['start', 'new', 'open', 'review'])
-    const label = `[${this.label}] ${kind === 'chat' ? '채팅 답' : ENGINE_KO[engine]}`
+    const slugs = slugsOf(out, kind === 'chat' ? ['chats'] : kind === 'polish' ? ['polish'] : ['start', 'new', 'open', 'review'])
+    const label = `[${this.label}] ${kind === 'chat' ? '채팅 답' : kind === 'polish' ? '스킬대로 다듬기' : ENGINE_KO[engine]}`
     const bin = await ensureEngine(engine)
     if (!bin) { this.log(`${ENGINE_KO[engine]} 를 찾지 못해 실행하지 못했어요`); void beat(key, { slugs, kind, phase: 'error', error: `이 컴퓨터에 ${ENGINE_KO[engine]} 가 없어요 — 설치 스크립트를 다시 실행해 주세요` }); return }
-    this.log(`(${why}) ${kind === 'chat' ? `채팅 물음 ${n}개` : `할 일 ${n}건`} → ${ENGINE_KO[engine]} 시작`)
+    this.log(`(${why}) ${kind === 'chat' ? `채팅 물음 ${n}개` : kind === 'polish' ? `다듬을 조각 ${n}개` : `할 일 ${n}건`} → ${ENGINE_KO[engine]} 시작`)
     const opts = { key, kind, slugs, label, cwd: this.dir }
     if (engine === 'claude-code') {
       this.writeMcp(key)
-      const tools = kind === 'chat' ? ['mcp__pes__pending_work', 'mcp__pes__answer_chat', 'mcp__pes__get_project', 'mcp__pes__list_items', 'mcp__pes__get_item', 'mcp__pes__update_item'] : ROUND_TOOLS
-      return runAgent(engine, bin, prompt, ['-p', '--mcp-config', this.mcpCfg, '--strict-mcp-config', '--allowedTools', ...tools, ...(kind === 'chat' ? ['--model', 'sonnet'] : []), ...STREAM], opts)
+      const tools = kind === 'chat' ? ['mcp__pes__pending_work', 'mcp__pes__answer_chat', 'mcp__pes__get_project', 'mcp__pes__list_items', 'mcp__pes__get_item', 'mcp__pes__update_item'] : kind === 'polish' ? ['mcp__pes__pending_work', 'mcp__pes__get_polish', 'mcp__pes__submit_polish'] : ROUND_TOOLS
+      return runAgent(engine, bin, prompt, ['-p', '--mcp-config', this.mcpCfg, '--strict-mcp-config', '--allowedTools', ...tools, ...(kind === 'chat' || kind === 'polish' ? ['--model', 'sonnet'] : []), ...STREAM], opts)
     }
     // 키는 파일에 적지 않고 환경 변수로만 넘긴다
     const env = { ...process.env, PES_MCP_TOKEN: key }
@@ -404,6 +412,22 @@ class Account {
     this.log(`채팅 물음 ${left}개가 남아 ${wait / 1000}초 뒤 다시 답해요`)
     this.chatRetry = setTimeout(() => void this.runChats('남은 채팅 다시'), wait)
   }
+  // 「한글로 열기」 스킬대로 다듬기 — 라운드 · 채팅과 따로 돈다. 다 하면 남은 게 있는지 한 번 더 본다
+  async runPolish(why) {
+    if (this.stopped) return
+    if (this.polishing) { this.polishAgain = true; return }
+    const key = await this.key(); if (!key) return
+    this.polishing = true
+    try {
+      const { out } = await pending(key)
+      const n = Array.isArray(out?.polish) ? out.polish.length : 0
+      if (!n) return
+      await this.agent('polish', POLISH_PROMPT, out, key, why, n)
+    } catch (e) { this.log('다듬기 오류', e?.message ?? e) } finally {
+      this.polishing = false
+      if (this.polishAgain) { this.polishAgain = false; void this.runPolish('밀린 다듬기') }
+    }
+  }
   async runChats(why) {
     if (this.stopped) return
     if (this.chatting) { this.chatAgain = true; return }
@@ -427,7 +451,7 @@ class Account {
     if (!key) { this.log(`키를 받지 못했어요 — 이 계정은 다시 붙여야 해요: node worker.mjs --remove ${this.id} 뒤 --add. 10분 뒤 다시 시도해요.`); setTimeout(() => void this.connect(), 10 * 60_000); return }
     const ws = new WebSocket(`${BASE.replace(/^http/, 'ws')}/mcp/live`, { headers: { authorization: `Bearer ${key}` } })
     this.ws = ws
-    ws.onopen = () => { this.retry = 0; this.log('PES 알림에 붙었어요'); this.ping = setInterval(() => { try { ws.send('ping') } catch {} }, 25_000); this.schedule('붙음 · 밀린 일 확인', 500); void this.runChats('붙음 · 밀린 채팅') }
+    ws.onopen = () => { this.retry = 0; this.log('PES 알림에 붙었어요'); this.ping = setInterval(() => { try { ws.send('ping') } catch {} }, 25_000); this.schedule('붙음 · 밀린 일 확인', 500); void this.runChats('붙음 · 밀린 채팅'); void this.runPolish('붙음 · 밀린 다듬기') }
     ws.onmessage = (e) => {
       if (e.data === 'pong') return
       try {
@@ -435,6 +459,7 @@ class Account {
         if (m.kind !== 'work') return
         this.log(`알림: ${m.stage}`)
         if (/ chat$/.test(m.stage)) void this.runChats(m.stage) // 채팅은 바로, 라운드 일과 따로
+        else if (/ polish$/.test(m.stage)) void this.runPolish(m.stage) // 스킬대로 다듬기도 따로
         else this.schedule(m.stage)
       } catch {}
     }
