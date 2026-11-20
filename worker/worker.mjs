@@ -46,7 +46,7 @@ process.env.PATH = [...FIRST, process.env.PATH || (WIN ? '' : '/usr/bin:/bin')].
 const EXTS = WIN ? ['.exe', '.cmd', '.bat', ''] : ['']
 const which = (n) => { for (const d of process.env.PATH.split(SEP)) for (const x of EXTS) { const f = join(d, n + x); try { if (statSync(f).isFile()) return f } catch {} } return null }
 const CLAUDE = process.env.CLAUDE_BIN || which('claude') || (WIN ? 'claude.exe' : '/opt/homebrew/bin/claude')
-// ── 엔진: 계정마다 PES 「외부 AI 연결」에서 고른 AI(GET /mcp/me 의 engine)로 라운드 · 채팅을 돌린다 ──
+// ── 엔진: 프로젝트마다 PES 에서 고른 AI(pending_work 의 일마다 붙는 engine)로 돌린다. 따로 고르지 않은 프로젝트는 계정 기본 AI(「외부 AI 연결」 창 · GET /mcp/me 의 engine) ──
 //   claude-code: Claude Code(claude -p) · codex: Codex CLI(codex exec) · opencode: OpenCode(opencode run)
 //   Codex · OpenCode 가 없으면 이 컴퓨터의 npm 으로 받는다(macOS · Linux: ~/.pes/runtime, Windows: npm 전역 %APPDATA%\npm). 처음 한 번 로그인은 사람이 한다
 const ENGINE_KO = { 'claude-code': 'Claude Code', codex: 'Codex', opencode: 'OpenCode' }
@@ -393,11 +393,10 @@ class Account {
   }
   /**
    * 고른 엔진으로 프롬프트를 돌린다 — 엔진은 실행할 때마다 PES(GET /mcp/me)에 묻는다(PES 「외부 AI 연결」에서 바꾸면 다음 일부터 그 엔진)
+   *   프로젝트마다 다른 AI를 고를 수 있다 — pending_work 의 일마다 붙는 engine 으로 묶어(byEngine) 묶음마다 그 AI를 띄운다
    *   claude-code: 도구를 이름으로 묶는다(--allowedTools) · codex: 작업 폴더만 쓰기 + 인터넷 허용, 확인 없이 · opencode: 셸은 조사 도구만, 파일 고치기 막음
    */
-  async agent(kind, prompt, out, key, why, n) {
-    const me = await whoIs(key)
-    const engine = engineOf(me?.engine)
+  async agent(kind, prompt, out, key, why, n, engine) {
     const slugs = slugsOf(out, kind === 'chat' ? ['chats'] : kind === 'polish' ? ['polish'] : ['start', 'new', 'open', 'review'])
     const label = `[${this.label}] ${kind === 'chat' ? '채팅 답' : kind === 'polish' ? '스킬대로 다듬기' : ENGINE_KO[engine]}`
     const bin = await ensureEngine(engine)
@@ -461,6 +460,24 @@ class Account {
     // --standalone: 이미 떠 있는 OpenCode 백그라운드 서비스가 아니라 이 실행만의 서버로 — 그래야 이 계정의 설정(OPENCODE_CONFIG)과 키(PES_MCP_TOKEN)를 읽는다
     return runAgent(engine, bin, prompt, ['run', '--standalone', '--format', 'json', '--auto'], { ...opts, env: { ...env, OPENCODE_CONFIG: cfg, XDG_CONFIG_HOME: xdg } })
   }
+  /**
+   * 할 일을 맡을 AI별로 묶는다 — 일마다 붙은 engine(프로젝트에 고른 AI, 없으면 계정 기본 AI). 예전 서버라 engine 이 없으면 계정 기본 AI(GET /mcp/me)
+   * 돌려주는 것: [{ engine, part(그 AI 몫만 담은 pending_work 꼴), n(건수), only(프롬프트에 붙일 「이 프로젝트만」 줄) }]
+   */
+  async byEngine(kind, out, key) {
+    const ks = kind === 'chat' ? ['chats'] : kind === 'polish' ? ['polish'] : ['start', 'new', 'open', 'review']
+    const def = engineOf((await whoIs(key))?.engine)
+    const g = new Map()
+    for (const k of ks) for (const x of Array.isArray(out?.[k]) ? out[k] : []) {
+      const e = ENGINE_BIN[x?.engine] ? x.engine : def
+      const o = g.get(e) ?? {}; (o[k] ??= []).push(x); g.set(e, o)
+    }
+    return [...g].map(([engine, part]) => {
+      const slugs = slugsOf(part, ks)
+      return { engine, part, n: ks.reduce((s, k) => s + (part[k]?.length ?? 0), 0),
+        only: `\n맡은 프로젝트: 이번 실행은 slug ${slugs.join(' · ')} 만 맡는다. pending_work 에 다른 프로젝트가 보여도 읽거나 고치지 않는다(프로젝트마다 맡는 AI가 따로 있다). 남은 일을 다시 볼 때도 이 프로젝트만 본다.` }
+    })
+  }
   schedule(why, ms = 2000) { clearTimeout(this.timer); this.timer = setTimeout(() => void this.run(why), ms) }
   async run(why) {
     if (this.stopped) return
@@ -472,7 +489,7 @@ class Account {
       const n = ['start', 'new', 'open', 'review'].reduce((s, k) => s + (Array.isArray(out?.[k]) ? out[k].length : 0), 0) // 채팅은 runChats 가
       if (!n) { this.log(`(${why}) 라운드 일 없음`); return }
       await ensureTools() // 조사 도구가 빠졌으면 먼저 설치(6시간에 한 번 확인)
-      await this.agent('round', PROMPT + SKILL_RULE() + EGO_RULE() + KORDOC_RULE(), out, key, why, n)
+      for (const g of await this.byEngine('round', out, key)) await this.agent('round', PROMPT + SKILL_RULE() + EGO_RULE() + KORDOC_RULE() + g.only, g.part, key, why, g.n, g.engine)
     } catch (e) { this.log('오류', e?.message ?? e) } finally {
       this.running = false
       if (this.again) { this.again = false; this.schedule('밀린 알림', 1000) }
@@ -501,7 +518,7 @@ class Account {
       const { out } = await pending(key)
       const n = Array.isArray(out?.polish) ? out.polish.length : 0
       if (!n) return
-      await this.agent('polish', POLISH_PROMPT, out, key, why, n)
+      for (const g of await this.byEngine('polish', out, key)) await this.agent('polish', POLISH_PROMPT + g.only, g.part, key, why, g.n, g.engine)
     } catch (e) { this.log('다듬기 오류', e?.message ?? e) } finally {
       this.polishing = false
       if (this.polishAgain) { this.polishAgain = false; void this.runPolish('밀린 다듬기') }
@@ -516,7 +533,7 @@ class Account {
       const { out } = await pending(key)
       const n = Array.isArray(out?.chats) ? out.chats.length : 0
       if (!n) return
-      await this.agent('chat', CHAT_PROMPT, out, key, why, n)
+      for (const g of await this.byEngine('chat', out, key)) await this.agent('chat', CHAT_PROMPT + g.only, g.part, key, why, g.n, g.engine)
     } catch (e) { this.log('채팅 오류', e?.message ?? e) } finally {
       this.chatting = false
       if (this.chatAgain) { this.chatAgain = false; void this.runChats('밀린 채팅') }

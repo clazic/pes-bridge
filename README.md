@@ -58,7 +58,7 @@ irm https://raw.githubusercontent.com/clazic/pes-bridge/main/install.ps1 | iex
 
 ### 쓸 AI 고르기 — Claude Code · Codex · OpenCode
 
-브리지는 계정마다 PES 「외부 AI 연결」 창에서 고른 AI로 일합니다(일을 받을 때마다 PES 에 묻습니다 — 바꾸면 다음 일부터 그 AI).
+브리지는 **프로젝트마다** PES 에서 고른 AI로 일합니다 — 프로젝트 화면 맨 위 「작업 AI」 옆 「외부 AI 종류」에서 고르고, 따로 고르지 않은 프로젝트는 「외부 AI 연결」 창의 기본 AI가 맡습니다. 일을 받을 때마다 PES 가 일마다 맡을 AI를 알려 주므로, 바꾸면 다음 일부터 그 AI가 합니다. 한 번에 받은 일이 여러 AI 몫이면 AI별로 묶어 차례로 돌리고, 각 AI에게는 자기 몫 프로젝트만 맡깁니다.
 
 | AI | 실행 | PES 연결 | 조사 도구 · 권한 |
 |---|---|---|---|
