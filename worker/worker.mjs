@@ -196,7 +196,7 @@ const SKILL_RULE = () => { const l = ['kosis', 'vworld', 'sgis'].map((n) => [n, 
 // LAW_OC(법령 API 값)는 설치 때 ~/.claude/settings.json 의 env 에 넣는다 — --restricted 의 Claude Code 는 그 설정을 읽지 않고 Codex · OpenCode 는 원래 읽지 않으니, 브리지가 환경 변수로 넘긴다
 const CLAUDE_SETTINGS = join(homedir(), '.claude', 'settings.json')
 const loadLawOc = () => { if (process.env.LAW_OC) return; const v = readJson(CLAUDE_SETTINGS)?.env?.LAW_OC; if (v) process.env.LAW_OC = String(v) }
-// ── 이 컴퓨터에서 쓸 수 있는 모델 목록 — PES 「외부 AI 연결」 창의 「단계별 모델」이 이 목록에서 고른다(POST /mcp/models). 6시간에 한 번 다시 읽는다 ──
+// ── 이 컴퓨터에서 쓸 수 있는 모델 목록 · 붙어 있는 AI — PES 「외부 AI 연결」 창이 이 목록에서 고른다(POST /mcp/models). 붙을 때와 한 시간마다 올린다 ──
 //   Claude Code: 시작 응답(control initialize)의 models · Codex: codex debug models · OpenCode: opencode models
 const MODEL_ID = /^[A-Za-z0-9][\w.:/@[\]-]{0,79}$/
 const okModel = (v) => (typeof v === 'string' && MODEL_ID.test(v) ? v : '')
@@ -213,7 +213,7 @@ function claudeModels(bin) {
       for (let i; (i = buf.indexOf('\n')) >= 0;) {
         const l = buf.slice(0, i); buf = buf.slice(i + 1)
         if (!l.includes('control_response')) continue
-        try { const ms = JSON.parse(l)?.response?.response?.models; if (Array.isArray(ms)) end(ms.map((m) => ({ id: m?.value, name: m?.displayName, note: m?.description, efforts: Array.isArray(m?.supportedEffortLevels) ? m.supportedEffortLevels.filter(okEffort) : [] }))) } catch {}
+        try { const ms = JSON.parse(l)?.response?.response?.models; if (Array.isArray(ms)) end(Object.assign(ms.map((m) => ({ id: m?.value, name: m?.displayName, note: m?.description, efforts: Array.isArray(m?.supportedEffortLevels) ? m.supportedEffortLevels.filter(okEffort) : [] })), { login: !!JSON.parse(l)?.response?.response?.account })) } catch {}
       }
     })
     // 물음은 보내지 않는다(모델을 부르지 않는다) — 시작 응답만 받고 끈다
@@ -222,12 +222,14 @@ function claudeModels(bin) {
 }
 let catAt = 0, catalog = null
 async function modelCatalog() {
-  if (catalog && Date.now() - catAt < 6 * 3600_000) return catalog
-  const list = {}, def = {}
+  if (catalog && Date.now() - catAt < 50 * 60_000) return catalog
+  // ready: 이 컴퓨터에 붙어 있는 AI(설치 + 로그인) — PES 화면이 이 AI만 고르게 한다
+  const list = {}, def = {}, ready = { 'claude-code': false, codex: false, opencode: false }
   const cl = process.env.CLAUDE_BIN || which('claude')
   if (cl && !(WIN && /\.(cmd|bat)$/i.test(cl))) {
     // default(Claude Code 가 고르는 기본)는 뺀다 — PES 에서 비워 두면 이 컴퓨터의 기본 모델로 돈다
-    const ms = (await claudeModels(cl)).filter((m) => okModel(m.id) && m.id !== 'default')
+    const got = await claudeModels(cl), ms = got.filter((m) => okModel(m.id) && m.id !== 'default')
+    ready['claude-code'] = ms.length > 0 && got.login !== false
     if (ms.length) list['claude-code'] = ms
     def['claude-code'] = okModel(readJson(CLAUDE_SETTINGS)?.model)
   }
@@ -238,6 +240,7 @@ async function modelCatalog() {
       const j = JSON.parse(r.out), ms = (Array.isArray(j) ? j : j?.models ?? []).filter((m) => m?.visibility === 'list' && okModel(m.slug)).sort((a, b) => (a.priority ?? 99) - (b.priority ?? 99))
       if (ms.length) list.codex = ms.map((m) => ({ id: m.slug, name: m.display_name, note: m.description, efforts: (m.supported_reasoning_levels ?? []).map((x) => okEffort(typeof x === 'string' ? x : x?.effort)).filter(Boolean), effort: okEffort(m.default_reasoning_level) }))
     } catch {}
+    ready.codex = /logged in/i.test(((r) => r.out + r.err)(await exec(cx, ['login', 'status'], 30_000)))
     try { def.codex = okModel(/^model\s*=\s*"([^"]+)"/m.exec(readFileSync(join(homedir(), '.codex', 'config.toml'), 'utf8'))?.[1]) } catch {}
   }
   const oc = which('opencode')
@@ -245,11 +248,12 @@ async function modelCatalog() {
     const r = await exec(oc, ['models'], 40_000)
     const ms = r.out.split('\n').map((x) => x.trim()).filter(okModel)
     if (ms.length) list.opencode = ms.map((id) => ({ id, name: '', note: '' }))
+    ready.opencode = /stored|oauth|api/i.test(((r) => r.out + r.err)(await exec(oc, ['auth', 'list'], 30_000)))
     def.opencode = okModel(readJson(join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'opencode', 'opencode.json'))?.model)
   }
   for (const k of Object.keys(def)) if (!def[k]) delete def[k]
-  if (Object.keys(list).length) { catalog = { list, def }; catAt = Date.now() }
-  return { list, def }
+  if (Object.keys(list).length) { catalog = { list, def, ready }; catAt = Date.now() }
+  return { list, def, ready }
 }
 // Claude Code 의 --restricted(사용자 · 프로젝트 설정 · 훅 · CLAUDE.md 를 읽지 않고, 파일 도구를 작업 폴더와 --add-dir 안으로 가둔다)가 있는 판인지 — 없으면 예전 방식으로 돌고 업데이트를 권한다
 let restrictOk = false, restrictWarned = false
@@ -550,12 +554,12 @@ class Account {
     })
   }
   /** 이 컴퓨터의 모델 목록을 PES 에 올린다 — 「외부 AI 연결」 창의 「단계별 모델」이 이 목록에서 고른다 */
-  async sendModels(key) {
+  async sendModels(key, quiet = false) {
     try {
       const c = await modelCatalog()
       if (!Object.keys(c.list).length) return
       const r = await fetch(`${BASE}/mcp/models`, { method: 'POST', headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' }, body: JSON.stringify(c) })
-      this.log(r.ok ? `모델 목록을 올렸어요 — ${Object.entries(c.list).map(([e, l]) => `${ENGINE_KO[e]} ${l.length}개`).join(' · ')}` : `모델 목록을 올리지 못했어요(${r.status})`)
+      if (!quiet || !r.ok) this.log(r.ok ? `모델 목록을 올렸어요 — ${Object.entries(c.list).map(([e, l]) => `${ENGINE_KO[e]} ${l.length}개`).join(' · ')} · 붙은 AI: ${Object.keys(c.ready).filter((e) => c.ready[e]).map((e) => ENGINE_KO[e]).join(' · ') || '없음'}` : `모델 목록을 올리지 못했어요(${r.status})`)
     } catch (e) { this.log('모델 목록 오류', e?.message ?? e) }
   }
   schedule(why, ms = 2000) { clearTimeout(this.timer); this.timer = setTimeout(() => void this.run(why), ms) }
@@ -629,7 +633,7 @@ class Account {
     if (!key) { this.log(`키를 받지 못했어요 — 이 계정은 다시 붙여야 해요: node worker.mjs --remove ${this.id} 뒤 --add. 10분 뒤 다시 시도해요.`); setTimeout(() => void this.connect(), 10 * 60_000); return }
     const ws = new WebSocket(`${BASE.replace(/^http/, 'ws')}/mcp/live`, { headers: { authorization: `Bearer ${key}` } })
     this.ws = ws
-    ws.onopen = () => { this.retry = 0; this.dead = false; this.log('PES 알림에 붙었어요'); this.ping = setInterval(() => { try { ws.send('ping') } catch {} }, 25_000); this.schedule('붙음 · 밀린 일 확인', 500); void this.runChats('붙음 · 밀린 채팅'); void this.runPolish('붙음 · 밀린 다듬기'); void this.sendModels(key) }
+    ws.onopen = () => { this.retry = 0; this.dead = false; this.log('PES 알림에 붙었어요'); this.ping = setInterval(() => { try { ws.send('ping') } catch {} }, 25_000); this.schedule('붙음 · 밀린 일 확인', 500); void this.runChats('붙음 · 밀린 채팅'); void this.runPolish('붙음 · 밀린 다듬기'); void this.sendModels(key); this.modelTick ??= setInterval(() => void this.key().then((k) => k && !this.stopped && this.sendModels(k, true)), 3600_000) }
     ws.onmessage = (e) => {
       if (e.data === 'pong') return
       try {
@@ -667,7 +671,7 @@ class Account {
     const wait = Math.min(60_000, 1000 * 2 ** this.retry++)
     this.log(`알림 연결 끊김(1006) — ${Math.round(wait / 1000)}초 뒤 다시`); setTimeout(() => void this.connect(), wait)
   }
-  stop() { this.stopped = true; clearTimeout(this.timer); clearTimeout(this.chatRetry); clearInterval(this.ping); try { this.ws?.close() } catch {} }
+  stop() { this.stopped = true; clearInterval(this.modelTick); clearTimeout(this.timer); clearTimeout(this.chatRetry); clearInterval(this.ping); try { this.ws?.close() } catch {} }
 }
 
 // ── 계정들 — 켤 때 · 30초마다 계정 폴더를 보고 새 계정은 붙이고, 지운 계정은 뗀다. 같은 사람(PES 사용자 번호)은 한 번만 ──

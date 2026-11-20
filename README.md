@@ -98,6 +98,7 @@ node ~/.pes/bridge/worker/worker.mjs --remove a2   # 계정 떼기(번호 또는
 ## 모델 바꾸기
 
 - 단계별 모델: PES 「외부 AI 연결」 창의 「단계별 모델」에서 AI(Claude Code · Codex · OpenCode)마다 기획 · 조사 · 분석·종합 · 집필 · 검증 · 산출 단계의 모델을 고릅니다. 브리지는 PES 에 붙을 때 이 컴퓨터에서 쓸 수 있는 모델 목록을 올리고(Claude Code 시작 응답 · `codex debug models` · `opencode models`, 6시간에 한 번 다시 읽음), 일마다 붙어 오는 `model` 로 돌립니다(`--model` · `-m` · 설정 `model`). 단계별 모델을 고른 계정은 한 번 실행이 지금 단계까지만 하고, 다음 단계는 그 단계의 모델로 새로 띄웁니다.
+- 단계별 AI: 같은 자리의 「단계별 AI」에서 단계마다 맡을 AI를 섞어 고를 수 있습니다(프로젝트에 AI를 따로 고르지 않았을 때). 브리지는 이 컴퓨터에 붙어 있는 AI(설치 + 로그인)를 붙을 때와 한 시간마다 알리고, PES 화면은 그 AI만 고르게 합니다.
 - 단계별 effort(생각 깊이): 같은 자리에서 단계마다 고릅니다. Claude Code 는 `--effort`, Codex 는 `-c model_reasoning_effort=`, OpenCode 는 `--model 모델#값` 으로 넘깁니다. OpenCode 는 모델마다 되는 값이 달라, 안 되는 값이면(`Variant unavailable`) effort 없이 다시 돌립니다.
 - 고르지 않은 단계(「기본」)의 라운드 글쓰기 · 점검: Claude Code 의 기본 모델(`claude` 에서 `/model` 로 고르면 `~/.claude/settings.json` 의 `model` 에 저장)을 따릅니다 — 브리지가 그 값을 읽어 `--model` 로 넘깁니다.
 - 채팅 답 · 「한글로 열기」 다듬기: 빠른 답을 위해 `sonnet` 을 씁니다(`worker/worker.mjs` 의 `agent`).
