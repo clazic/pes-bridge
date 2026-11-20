@@ -5,7 +5,7 @@
 PES 프로젝트의 작업 AI를 「외부 AI」로 고르면, 글쓰기·조사·채팅 답을 PES 서버가 아니라 **내 컴퓨터의 Claude Code**가 합니다. 이 프로그램은 컴퓨터에 조용히 떠 있다가 PES에서 일이 생기면 알림을 받아 처리합니다. Claude 앱이나 터미널 창을 열어 둘 필요가 없습니다.
 
 - 조사는 이 컴퓨터의 도구로 합니다: 통계 **kosis**, 공간정보 **vworld**, 통계지리 **sgis**, 법령 **korean-law**, 문서 변환 **kordoc**(HWP·HWPX·PDF·오피스 → Markdown), 브라우저 **ego lite**(자바스크립트로 그리는 원문·첨부 받기)
-- 일하는 동안 PES 화면에 「외부 AI가 일하는 중이에요 · 지금 항목을 읽는 중」처럼 실제 상태가 보입니다(멈추면 30초 안에 「멈춤」으로 바뀜)
+- 일하는 동안 PES 화면에 「외부 AI가 일하는 중이에요 · 지금 항목을 읽는 중」처럼 실제 상태가 보입니다. AI 출력이 3분 넘게 끊기면 신호를 멈춰 화면이 「멈춤」으로 바뀌고, 10분 동안 응답이 없거나 한 번 실행이 상한(라운드 2시간 · 채팅 · 다듬기 20분)을 넘으면 그 실행을 끝내고 오류로 알립니다(다음 일이 막히지 않게)
 
 ## 원클릭 설치
 
@@ -62,8 +62,8 @@ irm https://raw.githubusercontent.com/clazic/pes-bridge/main/install.ps1 | iex
 
 | AI | 실행 | PES 연결 | 조사 도구 · 권한 |
 |---|---|---|---|
-| Claude Code | `claude -p` | `--mcp-config`(계정 폴더 `mcp.json`) | 이름으로 묶은 도구만(`--allowedTools`) |
-| Codex | `codex exec --json` | `-c mcp_servers.pes.url=…` + 토큰은 환경 변수 `PES_MCP_TOKEN` | 계정 폴더 · `~/.pes/docs` 만 쓰기, 인터넷 허용, 확인 없이(`approval_policy=never`), 사용자 설정은 읽지 않음 |
+| Claude Code | `claude -p --restricted` | `--mcp-config`(계정 폴더 `mcp.json`) | 이름으로 묶은 도구만(`--tools` · `--allowedTools`), 내 설정 · 훅 · CLAUDE.md 는 읽지 않음, 파일 읽기는 작업 폴더 · `~/.pes/docs` · 조사 도구 사용법 폴더만 |
+| Codex | `codex exec --json` | `-c mcp_servers.pes.url=…` + 토큰은 환경 변수 `PES_MCP_TOKEN` | 작업 폴더(`~/.pes/work/<계정>`) · `~/.pes/docs` 만 쓰기, 인터넷 허용, 확인 없이(`approval_policy=never`), 사용자 설정은 읽지 않음 |
 | OpenCode | `opencode run --standalone --format json --auto`(떠 있는 백그라운드 서비스 말고 이 실행만의 서버 — 그래야 계정 설정 · 키를 읽는다) | 계정 폴더 `opencode.json`(`OPENCODE_CONFIG`, 토큰은 `{env:PES_MCP_TOKEN}`, `oauth: false`) | 셸은 조사 도구(kosis · vworld · sgis · korean-law · kordoc · ego-browser)만, 파일 고치기 막음 |
 
 설치 스크립트가 Codex(`@openai/codex`) · OpenCode(`opencode-ai`)를 확인하고 없으면 받습니다 — macOS · Linux 는 `~/.pes/runtime`(npm `--prefix`), Windows 는 npm 전역(`%APPDATA%\npm`). 설치 뒤에 지운 경우에도 그 AI를 고른 계정이 일을 받으면 브리지가 다시 받습니다. **처음 한 번 로그인은 사람이 합니다**: `codex login` · `opencode auth login`. 준비 상태는 `node ~/.pes/bridge/worker/worker.mjs --check` 로 봅니다.
@@ -97,13 +97,20 @@ node ~/.pes/bridge/worker/worker.mjs --remove a2   # 계정 떼기(번호 또는
 
 ## 모델 바꾸기
 
-- 라운드 글쓰기 · 점검: Claude Code 의 기본 모델(`claude` 에서 `/model` 로 고르면 `~/.claude/settings.json` 의 `model` 에 저장)을 따릅니다.
-- 채팅 답: 빠른 답을 위해 `sonnet` 을 씁니다(`worker/worker.mjs` 의 `runChats`).
+- 라운드 글쓰기 · 점검: Claude Code 의 기본 모델(`claude` 에서 `/model` 로 고르면 `~/.claude/settings.json` 의 `model` 에 저장)을 따릅니다 — 브리지가 그 값을 읽어 `--model` 로 넘깁니다.
+- 채팅 답 · 「한글로 열기」 다듬기: 빠른 답을 위해 `sonnet` 을 씁니다(`worker/worker.mjs` 의 `agent`).
+
+## 멈춤 감지 시간 바꾸기
+
+환경 변수(분)로 바꿉니다: `PES_BRIDGE_IDLE_MIN`(응답 없음, 기본 10) · `PES_BRIDGE_ROUND_MAX_MIN`(라운드 상한, 기본 120) · `PES_BRIDGE_CHAT_MAX_MIN` · `PES_BRIDGE_POLISH_MAX_MIN`(기본 20).
 
 ## 안전
 
 - 키 · 토큰은 이 컴퓨터에만 둡니다: PES 연결 토큰 `~/.config/pes-bridge/`(본인만 읽기), 조사 도구 키는 각 도구 설정, LAW_OC 는 `~/.claude/settings.json` 의 `env`.
 - worker 의 Claude Code 는 허용한 도구만 씁니다: PES MCP · 웹 검색/읽기 · 스킬 · 파일 읽기, 그리고 `kosis` · `vworld` · `sgis` · `korean-law` · `kordoc` · `ego-browser` 로 시작하는 명령 하나씩(파이프 · `&&` · `;` 없이).
+- Claude Code 는 `--restricted` 로 돕니다(Claude Code 2.1 의 새 판부터 — 없는 판이면 예전 방식으로 돌고 로그에 업데이트하라고 남깁니다): 내 `~/.claude` 설정 · 훅 · 플러그인 · CLAUDE.md 가 브리지 일에 섞이지 않고, 파일 읽기는 작업 폴더(`~/.pes/work/<계정>`) · `~/.pes/docs` · 조사 도구 사용법 폴더(`~/.claude/skills/kosis` · `vworld` · `sgis` · ego-browser) 안으로만 됩니다. 토큰이 있는 계정 폴더는 읽지 못합니다.
+- 어느 AI든 작업 폴더는 토큰이 없는 빈 폴더(`~/.pes/work/<계정>`)입니다. 법령 값 `LAW_OC` 는 브리지가 `~/.claude/settings.json` 에서 읽어 환경 변수로 넘깁니다(Codex · OpenCode 도 법령 조회가 됩니다).
+- Codex 는 셸 명령을 이름으로 묶지 못합니다(작업 폴더 밖 쓰기만 막힘) — 「조사 도구 명령만」은 규칙에 기댑니다.
 - **ego-browser 주의**: `ego-browser nodejs` 는 자바스크립트를 실행하므로 이 허용은 명령 제한이 아니라 규칙(공개 페이지 읽기만, 로그인 · 글쓰기 · 양식 제출 금지, 첨부는 `~/.pes/docs` 에만 저장)에 기댑니다. 반드시 로그인 없는 「PES」 프로필을 만들어 두세요.
 - 받은 원문 파일과 변환한 Markdown 은 `~/.pes/docs` 에 둡니다.
 
