@@ -478,6 +478,7 @@ class Account {
       const u = relay.close(run.token)
       const line = Object.entries(u).map(([t, a]) => `${t} ${a.map((c, i) => c ? `키${i + 1} ${c.calls}회${c.limited ? `(한도 ${c.limited})` : c.errors ? `(오류 ${c.errors})` : ''}` : '').filter(Boolean).join(' ')}`).join(' · ')
       if (line) this.log(`조사 도구 사용: ${line}`)
+      void this.vault.report(u) // PES 「조사 도구 · 그림 키」 창의 키별 사용량에 더한다
     }
   }
   async agentRun(kind, prompt, out, key, why, n, engine, pick, effort, penv) {

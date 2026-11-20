@@ -97,6 +97,19 @@ export class Vault {
       return tools
     } catch (e) { this.log(`조사 도구 키 받기 오류 — ${String(e?.message ?? e).slice(0, 120)}`); this.off = now + 60_000; return null }
   }
+  /** 로컬 중계가 센 키별 호출 수를 서버에 올린다(「조사 도구 · 그림 키」 창의 사용량) — 기기 키로 서명. 실패해도 일에는 지장 없다 */
+  async report(usage) {
+    try {
+      const list = {}
+      for (const [t, a] of Object.entries(usage ?? {})) { const x = a.filter((c) => c?.id && c.calls); if (x.length) list[t] = x.map(({ id, calls, errors, limited }) => ({ id, calls, errors, limited })) }
+      if (!Object.keys(list).length) return false
+      const token = await this.token()
+      if (!token || !(await this.bind(token))) return false
+      const u = JSON.stringify(list), nonce = randomBytes(24).toString('base64url'), ts = Date.now()
+      const r = await this.post('/mcp/tool-usage', { ts, nonce, u, sig: await this.sign(`pes-tool-usage\n${ts}\n${nonce}\n${u}`) }, token)
+      return r.status === 200
+    } catch { return false }
+  }
   forget() { this.cache = null }
 }
 
@@ -129,8 +142,13 @@ export class Relay {
     for (const [t, E] of Object.entries(RELAY_TOOLS)) env[`PES_RELAY_${E}_KEYS`] = String(pool[t].keys.length)
     return { token, env }
   }
-  /** 실행을 닫는다 → 그 실행의 키별 호출 수 {도구: [{calls, errors, limited}]} */
-  close(token) { const r = this.runs.get(token); this.runs.delete(token); return r?.usage ?? {} }
+  /** 실행을 닫는다 → 그 실행의 키별 호출 수 {도구: [{id(서버의 키 번호), calls, errors, limited}]} — 자리(키 차례)마다, 안 쓴 자리는 빈칸 */
+  close(token) {
+    const r = this.runs.get(token); this.runs.delete(token)
+    const out = {}
+    for (const [t, a] of Object.entries(r?.usage ?? {})) out[t] = Array.from(a, (c, i) => (c ? { id: r.pool[t].keys[i]?.id ?? 0, ...c } : null))
+    return out
+  }
   stop() { try { this.server?.close() } catch {} this.server = null; this.runs.clear() }
 
   fail(res, status, error) {
