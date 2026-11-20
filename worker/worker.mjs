@@ -200,6 +200,7 @@ const loadLawOc = () => { if (process.env.LAW_OC) return; const v = readJson(CLA
 //   Claude Code: 시작 응답(control initialize)의 models · Codex: codex debug models · OpenCode: opencode models
 const MODEL_ID = /^[A-Za-z0-9][\w.:/@[\]-]{0,79}$/
 const okModel = (v) => (typeof v === 'string' && MODEL_ID.test(v) ? v : '')
+const okEffort = (v) => (typeof v === 'string' && /^[a-z]{2,12}$/.test(v) ? v : '') // effort(생각 깊이): low · medium · high …
 function claudeModels(bin) {
   return new Promise((res) => {
     let buf = '', done = false, c
@@ -212,7 +213,7 @@ function claudeModels(bin) {
       for (let i; (i = buf.indexOf('\n')) >= 0;) {
         const l = buf.slice(0, i); buf = buf.slice(i + 1)
         if (!l.includes('control_response')) continue
-        try { const ms = JSON.parse(l)?.response?.response?.models; if (Array.isArray(ms)) end(ms.map((m) => ({ id: m?.value, name: m?.displayName, note: m?.description }))) } catch {}
+        try { const ms = JSON.parse(l)?.response?.response?.models; if (Array.isArray(ms)) end(ms.map((m) => ({ id: m?.value, name: m?.displayName, note: m?.description, efforts: Array.isArray(m?.supportedEffortLevels) ? m.supportedEffortLevels.filter(okEffort) : [] }))) } catch {}
       }
     })
     // 물음은 보내지 않는다(모델을 부르지 않는다) — 시작 응답만 받고 끈다
@@ -235,7 +236,7 @@ async function modelCatalog() {
     const r = await exec(cx, ['debug', 'models'], 40_000)
     try {
       const j = JSON.parse(r.out), ms = (Array.isArray(j) ? j : j?.models ?? []).filter((m) => m?.visibility === 'list' && okModel(m.slug)).sort((a, b) => (a.priority ?? 99) - (b.priority ?? 99))
-      if (ms.length) list.codex = ms.map((m) => ({ id: m.slug, name: m.display_name, note: m.description }))
+      if (ms.length) list.codex = ms.map((m) => ({ id: m.slug, name: m.display_name, note: m.description, efforts: (m.supported_reasoning_levels ?? []).map((x) => okEffort(typeof x === 'string' ? x : x?.effort)).filter(Boolean), effort: okEffort(m.default_reasoning_level) }))
     } catch {}
     try { def.codex = okModel(/^model\s*=\s*"([^"]+)"/m.exec(readFileSync(join(homedir(), '.codex', 'config.toml'), 'utf8'))?.[1]) } catch {}
   }
@@ -383,7 +384,7 @@ function runAgent(engine, bin, prompt, args, { key, kind, slugs, label, cwd, env
       phase = err ? 'error' : 'done'; tool = null
       void beat(key, { slugs, kind, phase, ...(err ? { error: err } : {}) })
       log(`${label} 끝(${code})${err ? ` — ${err}` : ''}`)
-      resolve()
+      resolve(err) // 오류 글(없으면 null) — OpenCode 의 「안 되는 effort」 다시 돌리기에 쓴다
     })
   })
 }
@@ -451,12 +452,13 @@ class Account {
    *   프로젝트마다 다른 AI를 고를 수 있다 — pending_work 의 일마다 붙는 engine 으로 묶어(byEngine) 묶음마다 그 AI를 띄운다
    *   claude-code: 도구를 이름으로 묶는다(--allowedTools) · codex: 작업 폴더만 쓰기 + 인터넷 허용, 확인 없이 · opencode: 셸은 조사 도구만, 파일 고치기 막음
    */
-  async agent(kind, prompt, out, key, why, n, engine, pick = '') {
+  async agent(kind, prompt, out, key, why, n, engine, pick = '', effort = '') {
+    effort = okEffort(effort)
     const slugs = slugsOf(out, kind === 'chat' ? ['chats'] : kind === 'polish' ? ['polish'] : ['start', 'new', 'open', 'review'])
     const label = `[${this.label}] ${kind === 'chat' ? '채팅 답' : kind === 'polish' ? '스킬대로 다듬기' : ENGINE_KO[engine]}`
     const bin = await ensureEngine(engine)
     if (!bin) { this.log(`${ENGINE_KO[engine]} 를 찾지 못해 실행하지 못했어요`); void beat(key, { slugs, kind, phase: 'error', error: `이 컴퓨터에 ${ENGINE_KO[engine]} 가 없어요 — 설치 스크립트를 다시 실행해 주세요` }); return }
-    this.log(`(${why}) ${kind === 'chat' ? `채팅 물음 ${n}개` : kind === 'polish' ? `다듬을 조각 ${n}개` : `할 일 ${n}건`} → ${ENGINE_KO[engine]}${okModel(pick) ? ` (${pick})` : ''} 시작`)
+    this.log(`(${why}) ${kind === 'chat' ? `채팅 물음 ${n}개` : kind === 'polish' ? `다듬을 조각 ${n}개` : `할 일 ${n}건`} → ${ENGINE_KO[engine]}${okModel(pick) || effort ? ` (${[okModel(pick), effort && `effort ${effort}`].filter(Boolean).join(' · ')})` : ''} 시작`)
     // 작업 폴더는 계정 폴더(토큰 · MCP 설정이 있다)가 아니라 빈 전용 폴더 — AI 의 파일 도구 · 셸이 토큰 파일 옆에서 돌지 않게
     const work = join(homedir(), '.pes', 'work', this.id)
     mkdirSync(work, { recursive: true }); mkdirSync(DOCS_DIR, { recursive: true })
@@ -470,7 +472,7 @@ class Account {
       const lock = (await canRestrict(bin)) ? ['--restricted', '--tools', ...(round ? ['WebSearch', 'WebFetch', 'Read', 'Bash'] : ['Read']), ...(round ? ['--add-dir', DOCS_DIR, ...skillDirs()] : [])] : []
       // 라운드 모델: PES 「단계별 모델」에서 고른 것(pick), 없으면 내 설정(~/.claude/settings.json 의 model — --restricted 가 읽지 않으니 그 값을 직접 넘긴다)
       const model = okModel(pick) || (round ? readJson(CLAUDE_SETTINGS)?.model : 'sonnet')
-      return runAgent(engine, bin, prompt, ['-p', ...lock, '--mcp-config', this.mcpCfg, '--strict-mcp-config', '--allowedTools', ...(lock.length ? tools.filter((t) => t !== 'Skill') : tools), ...(typeof model === 'string' && model ? ['--model', model] : []), ...STREAM], opts)
+      return runAgent(engine, bin, prompt, ['-p', ...lock, '--mcp-config', this.mcpCfg, '--strict-mcp-config', '--allowedTools', ...(lock.length ? tools.filter((t) => t !== 'Skill') : tools), ...(typeof model === 'string' && model ? ['--model', model] : []), ...(effort ? ['--effort', effort] : []), ...STREAM], opts)
     }
     // 키는 파일에 적지 않고 환경 변수로만 넘긴다
     const env = { ...process.env, PES_MCP_TOKEN: key }
@@ -483,7 +485,7 @@ class Account {
       const mcp = ['-c', `mcp_servers.pes.url="${BASE}/mcp"`, '-c', 'mcp_servers.pes.bearer_token_env_var="PES_MCP_TOKEN"', '-c', 'shell_environment_policy.exclude=["PES_MCP_TOKEN"]',
         // PES 도구 가운데 쓰는 것(answer_chat · merge_items …)은 Codex 가 승인을 묻는다 — 물을 사람이 없으니 PES 서버 도구는 승인 없이 쓰게 한다
         '-c', 'mcp_servers.pes.default_tools_approval_mode="approve"']
-      const head = ['exec', '--json', '--skip-git-repo-check', '--ignore-user-config', '-c', 'approval_policy="never"', ...(okModel(pick) ? ['-m', pick] : [])] // -m: PES 「단계별 모델」에서 고른 모델
+      const head = ['exec', '--json', '--skip-git-repo-check', '--ignore-user-config', '-c', 'approval_policy="never"', ...(okModel(pick) ? ['-m', pick] : []), ...(effort ? ['-c', `model_reasoning_effort="${effort}"`] : [])] // -m · model_reasoning_effort: PES 「단계별 모델」에서 고른 모델 · effort
       if (await canProfile(bin)) {
         const home = homedir().replace(/\\/g, '/'), fs = { ':root': 'read', [home]: 'deny', ':workspace_roots': 'write', ':tmpdir': 'write' }
         if (round) {
@@ -515,11 +517,19 @@ class Account {
     chmodSync(cfg, 0o600)
     const xdg = join(DIR, 'opencode-home'); mkdirSync(xdg, { recursive: true })
     // --standalone: 이미 떠 있는 OpenCode 백그라운드 서비스가 아니라 이 실행만의 서버로 — 그래야 이 계정의 설정(OPENCODE_CONFIG)과 키(PES_MCP_TOKEN)를 읽는다
-    return runAgent(engine, bin, prompt, ['run', '--standalone', '--format', 'json', '--auto'], { ...opts, env: { ...env, OPENCODE_CONFIG: cfg, XDG_CONFIG_HOME: xdg } })
+    const oOpts = { ...opts, env: { ...env, OPENCODE_CONFIG: cfg, XDG_CONFIG_HOME: xdg } }, oArgs = ['run', '--standalone', '--format', 'json', '--auto']
+    // effort 는 「모델#값」(변형)으로 넘긴다 — 모델마다 되는 값이 달라, 안 되는 값이면(Variant unavailable) effort 없이 다시 돌린다
+    const base = okModel(pick) || okModel(carry.model)
+    if (effort && base) {
+      const e = await runAgent(engine, bin, prompt, [...oArgs, '--model', `${base}#${effort}`], oOpts)
+      if (!/variant unavailable/i.test(String(e ?? ''))) return
+      this.log(`${base} 모델은 effort ${effort} 를 받지 않아요 — effort 없이 다시 돌려요`)
+    }
+    return runAgent(engine, bin, prompt, oArgs, oOpts)
   }
   /**
    * 할 일을 맡을 AI별로 묶는다 — 일마다 붙은 engine(프로젝트에 고른 AI, 없으면 계정 기본 AI). 예전 서버라 engine 이 없으면 계정 기본 AI(GET /mcp/me)
-   * 라운드 일은 모델까지 같은 것끼리 묶는다 — 일마다 붙은 model(PES 「외부 AI 연결」 창의 「단계별 모델」, 없으면 이 컴퓨터의 기본 모델)
+   * 라운드 일은 모델 · effort 까지 같은 것끼리 묶는다 — 일마다 붙은 model · effort(PES 「외부 AI 연결」 창의 「단계별 모델」, 없으면 이 컴퓨터의 기본 모델)
    * 돌려주는 것: [{ engine, model, part(그 AI · 모델 몫만 담은 pending_work 꼴), n(건수), only(프롬프트에 붙일 「이 프로젝트만」 줄) }]
    */
   async byEngine(kind, out, key) {
@@ -527,15 +537,15 @@ class Account {
     const def = engineOf((await whoIs(key))?.engine)
     const g = new Map()
     for (const k of ks) for (const x of Array.isArray(out?.[k]) ? out[k] : []) {
-      const e = ENGINE_BIN[x?.engine] ? x.engine : def, id = `${e}\n${okModel(x?.model)}`
+      const e = ENGINE_BIN[x?.engine] ? x.engine : def, id = `${e}\n${okModel(x?.model)}\n${okEffort(x?.effort)}`
       const o = g.get(id) ?? {}; (o[k] ??= []).push(x); g.set(id, o)
     }
     return [...g].map(([id, part]) => {
-      const slugs = slugsOf(part, ks), [engine, model] = id.split('\n')
+      const slugs = slugsOf(part, ks), [engine, model, effort] = id.split('\n')
       const all = ks.flatMap((k) => part[k] ?? [])
       // 단계별 모델을 고른 계정: 한 번 실행은 지금 단계까지만 — 다음 단계는 다른 모델일 수 있어 브리지가 새로 띄운다
       const stop = all.some((x) => x?.per_stage) ? `\n단계별 모델: 이번 실행은 지금 단계(${[...new Set(all.map((x) => `${x.slug} ${x.stage_name ?? x.stage}`))].join(' · ')}) 일만 한다. 7)과 달리, 그 단계를 승인(approve_stage)했거나 pending_work 에 다른 단계 일만 남았으면 그 일은 시작하지 않고 끝낸다(단계마다 맡는 모델이 따로 있다 — PES 브리지가 이어서 띄운다). 같은 단계의 다음 라운드는 이어서 한다.` : ''
-      return { engine, model, part, n: ks.reduce((s, k) => s + (part[k]?.length ?? 0), 0),
+      return { engine, model, effort, part, n: ks.reduce((s, k) => s + (part[k]?.length ?? 0), 0),
         only: stop + `\n맡은 프로젝트: 이번 실행은 slug ${slugs.join(' · ')} 만 맡는다. pending_work 에 다른 프로젝트가 보여도 읽거나 고치지 않는다(프로젝트마다 맡는 AI가 따로 있다). 남은 일을 다시 볼 때도 이 프로젝트만 본다.` }
     })
   }
@@ -559,7 +569,7 @@ class Account {
       const n = ['start', 'new', 'open', 'review'].reduce((s, k) => s + (Array.isArray(out?.[k]) ? out[k].length : 0), 0) // 채팅은 runChats 가
       if (!n) { this.log(`(${why}) 라운드 일 없음`); return }
       await ensureTools() // 조사 도구가 빠졌으면 먼저 설치(6시간에 한 번 확인)
-      for (const g of await this.byEngine('round', out, key)) await this.agent('round', PROMPT + SKILL_RULE() + EGO_RULE() + KORDOC_RULE() + g.only, g.part, key, why, g.n, g.engine, g.model)
+      for (const g of await this.byEngine('round', out, key)) await this.agent('round', PROMPT + SKILL_RULE() + EGO_RULE() + KORDOC_RULE() + g.only, g.part, key, why, g.n, g.engine, g.model, g.effort)
       // 단계별 모델: AI 가 단계 끝에서 멈췄으면 남은 일(다음 단계)을 그 모델로 이어 띄운다. 남은 일이 그대로면(진척 없음) 다시 띄우지 않는다
       const sig = (o) => RKS.flatMap((k) => (Array.isArray(o?.[k]) ? o[k] : []).map((x) => `${k}:${x.slug}:${x.stage}:${x.round ?? ''}`)).sort().join('|')
       if (RKS.some((k) => (out?.[k] ?? []).some((x) => x?.per_stage))) { const next = (await pending(key)).out; if (sig(next) && sig(next) !== sig(out)) this.again = true }
