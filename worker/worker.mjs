@@ -268,6 +268,13 @@ const READERS = {
     else if (m.type === 'error') fail(String(m.error?.data?.message ?? m.error?.message ?? m.error ?? '오류'))
   },
 }
+// Codex 의 권한 프로필(default_permissions · [permissions.<이름>])이 있는 판인지 — macOS · Linux 에서만 쓴다(Windows 샌드박스는 다르다). 없으면 예전 방식(workspace-write)
+let profileOk = null
+async function canProfile(bin) {
+  if (WIN || process.env.PES_BRIDGE_NO_RESTRICT === '1') return false
+  if (profileOk == null) { const r = await exec(bin, ['sandbox', '--help'], 30_000); profileOk = /--permission-profile\b/.test(r.out + r.err); if (!profileOk) log('이 Codex 에는 권한 프로필이 없어 파일 읽기 범위를 좁히지 못해요 — Codex 를 업데이트해 주세요(codex update)') }
+  return profileOk
+}
 // ── 멈춤 감지 ── 10초마다 보내는 신호는 AI 출력이 최근(QUIET_MS)에 있었을 때만 보낸다 — 출력이 끊기면 신호도 끊겨 화면이 「멈춤」이 된다.
 // 출력 없이 IDLE_MS 가 지나거나 한 번 실행이 MAX_MS 를 넘으면 프로세스를 끝내고 error 로 알린다(그래야 그 계정의 다음 일이 막히지 않는다).
 const mins = (name, d) => { const v = Number(process.env[name]); return (Number.isFinite(v) && v > 0 ? v : d) * 60_000 }
@@ -413,23 +420,46 @@ class Account {
     }
     // 키는 파일에 적지 않고 환경 변수로만 넘긴다
     const env = { ...process.env, PES_MCP_TOKEN: key }
+    const round = kind !== 'chat' && kind !== 'polish'
     if (engine === 'codex') {
-      return runAgent(engine, bin, prompt, ['exec', '--json', '--skip-git-repo-check', '--ignore-user-config', '-s', 'workspace-write',
-        '-c', 'approval_policy="never"', '-c', 'sandbox_workspace_write.network_access=true',
-        '-c', `mcp_servers.pes.url="${BASE}/mcp"`, '-c', 'mcp_servers.pes.bearer_token_env_var="PES_MCP_TOKEN"',
-        '--add-dir', DOCS_DIR, '-C', work, '-'], { ...opts, env })
+      // Codex 는 셸 명령을 이름으로 묶지 못한다(규칙은 금지만, 기본 거절이 없다). 그래서 셸이 닿는 곳을 좁힌다:
+      //   · 토큰(PES_MCP_TOKEN)은 셸 환경에서 뺀다 — MCP 연결은 Codex 본체가 한다
+      //   · 권한 프로필(되는 판 · macOS · Linux): 내 홈 폴더는 읽지 못하고, 작업 폴더 · 받은 원문 폴더 · 조사 도구 폴더만 연다. 채팅 · 다듬기는 인터넷도 끈다
+      //   · 내 규칙(~/.codex/rules) · 훅은 싣지 않는다
+      const mcp = ['-c', `mcp_servers.pes.url="${BASE}/mcp"`, '-c', 'mcp_servers.pes.bearer_token_env_var="PES_MCP_TOKEN"', '-c', 'shell_environment_policy.exclude=["PES_MCP_TOKEN"]']
+      const head = ['exec', '--json', '--skip-git-repo-check', '--ignore-user-config', '-c', 'approval_policy="never"']
+      if (await canProfile(bin)) {
+        const home = homedir().replace(/\\/g, '/'), fs = { ':root': 'read', [home]: 'deny', ':workspace_roots': 'write', ':tmpdir': 'write' }
+        if (round) {
+          fs[DOCS] = 'write'
+          for (const d of [RT, join(homedir(), '.local')]) if (existsSync(d)) fs[d.replace(/\\/g, '/')] = 'read'
+          for (const n of ['.kosis', '.sgis', '.vworld']) { const d = join(homedir(), n); if (existsSync(d)) fs[d.replace(/\\/g, '/')] = 'write' } // 조사 도구의 키 · 캐시 · 잠금 파일
+          for (const d of skillDirs()) fs[d] = 'read'
+        }
+        const perm = `permissions.pes={filesystem={${Object.entries(fs).map(([k, v]) => `${JSON.stringify(k)}=${JSON.stringify(v)}`).join(',')}},network={enabled=${round}}}`
+        return runAgent(engine, bin, prompt, [...head, '--ignore-rules', '--disable', 'hooks', '-c', 'default_permissions="pes"', '-c', perm, ...mcp, '-C', work, '-'], { ...opts, env })
+      }
+      return runAgent(engine, bin, prompt, [...head, '-s', 'workspace-write', '-c', 'sandbox_workspace_write.network_access=true', ...mcp, '--add-dir', DOCS_DIR, '-C', work, '-'], { ...opts, env })
     }
-    // OpenCode: 이 계정 폴더의 설정(PES MCP · 권한)을 사용자 설정 위에 얹는다(OPENCODE_CONFIG)
-    const cmds = [...RESEARCH, ...(EGO ? ['ego-browser'] : [])]
+    // OpenCode: 내 설정 폴더(~/.config/opencode 의 MCP 서버 · 플러그인 · 명령)는 싣지 않는다 — 빈 설정 폴더(XDG_CONFIG_HOME)로 돌리고,
+    // 내 설정에서는 모델 · 제공자만 옮겨 온다(로그인 정보는 다른 폴더라 그대로 쓴다). 이 계정의 설정(PES MCP · 권한)은 OPENCODE_CONFIG 로 준다
+    const cmds = round ? [...RESEARCH, ...(EGO ? ['ego-browser'] : [])] : []
     const bash = { '*': 'deny' }
     for (const c of cmds) { bash[c] = 'allow'; bash[`${c} *`] = 'allow' }
-    const cfg = join(this.dir, 'opencode.json')
-    writeFileSync(cfg, JSON.stringify({ $schema: 'https://opencode.ai/config.json',
+    // 작업 폴더 밖 파일은 받은 원문 폴더 · 조사 도구 사용법 폴더만(라운드). 채팅 · 다듬기는 밖을 읽지 않고 웹도 쓰지 않는다
+    const outside = { '*': 'deny' }
+    if (round) for (const d of [DOCS, ...skillDirs()]) { outside[d] = 'allow'; outside[`${d}/**`] = 'allow' }
+    const mine = readJson(join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'opencode', 'opencode.json')) ?? {}
+    const carry = Object.fromEntries(['model', 'small_model', 'provider', 'enabled_providers', 'disabled_providers'].filter((k) => mine[k] != null).map((k) => [k, mine[k]]))
+    const cfg = join(this.dir, `opencode-${round ? 'round' : kind}.json`) // 갈래마다 따로 — 라운드와 채팅이 함께 돌아도 서로 덮지 않게
+    writeFileSync(cfg, JSON.stringify({ $schema: 'https://opencode.ai/config.json', ...carry,
       // oauth: false — OpenCode 가 이 서버에 자체 로그인(OAuth)을 시도하지 않고 머리글의 키를 쓰게
       mcp: { pes: { type: 'remote', url: `${BASE}/mcp`, headers: { Authorization: 'Bearer {env:PES_MCP_TOKEN}' }, oauth: false, enabled: true } },
-      permission: { edit: 'deny', webfetch: 'allow', bash } }, null, 2))
+      permission: { edit: 'deny', webfetch: round ? 'allow' : 'deny', external_directory: outside, bash } }, null, 2))
+    chmodSync(cfg, 0o600)
+    const xdg = join(DIR, 'opencode-home'); mkdirSync(xdg, { recursive: true })
     // --standalone: 이미 떠 있는 OpenCode 백그라운드 서비스가 아니라 이 실행만의 서버로 — 그래야 이 계정의 설정(OPENCODE_CONFIG)과 키(PES_MCP_TOKEN)를 읽는다
-    return runAgent(engine, bin, prompt, ['run', '--standalone', '--format', 'json', '--auto'], { ...opts, env: { ...env, OPENCODE_CONFIG: cfg } })
+    return runAgent(engine, bin, prompt, ['run', '--standalone', '--format', 'json', '--auto'], { ...opts, env: { ...env, OPENCODE_CONFIG: cfg, XDG_CONFIG_HOME: xdg } })
   }
   schedule(why, ms = 2000) { clearTimeout(this.timer); this.timer = setTimeout(() => void this.run(why), ms) }
   async run(why) {

@@ -63,8 +63,8 @@ irm https://raw.githubusercontent.com/clazic/pes-bridge/main/install.ps1 | iex
 | AI | 실행 | PES 연결 | 조사 도구 · 권한 |
 |---|---|---|---|
 | Claude Code | `claude -p --restricted` | `--mcp-config`(계정 폴더 `mcp.json`) | 이름으로 묶은 도구만(`--tools` · `--allowedTools`), 내 설정 · 훅 · CLAUDE.md 는 읽지 않음, 파일 읽기는 작업 폴더 · `~/.pes/docs` · 조사 도구 사용법 폴더만 |
-| Codex | `codex exec --json` | `-c mcp_servers.pes.url=…` + 토큰은 환경 변수 `PES_MCP_TOKEN` | 작업 폴더(`~/.pes/work/<계정>`) · `~/.pes/docs` 만 쓰기, 인터넷 허용, 확인 없이(`approval_policy=never`), 사용자 설정은 읽지 않음 |
-| OpenCode | `opencode run --standalone --format json --auto`(떠 있는 백그라운드 서비스 말고 이 실행만의 서버 — 그래야 계정 설정 · 키를 읽는다) | 계정 폴더 `opencode.json`(`OPENCODE_CONFIG`, 토큰은 `{env:PES_MCP_TOKEN}`, `oauth: false`) | 셸은 조사 도구(kosis · vworld · sgis · korean-law · kordoc · ego-browser)만, 파일 고치기 막음 |
+| Codex | `codex exec --json` | `-c mcp_servers.pes.url=…` + 토큰은 환경 변수 `PES_MCP_TOKEN` | 작업 폴더(`~/.pes/work/<계정>`) · `~/.pes/docs` 만 쓰기, 인터넷 허용, 확인 없이(`approval_policy=never`), 사용자 설정 · 규칙 · 훅은 읽지 않음, 홈 폴더 읽기 막음(권한 프로필 — 「안전」 참고) |
+| OpenCode | `opencode run --standalone --format json --auto`(떠 있는 백그라운드 서비스 말고 이 실행만의 서버 — 그래야 계정 설정 · 키를 읽는다) | 계정 폴더 `opencode-round.json` · `opencode-chat.json` · `opencode-polish.json`(`OPENCODE_CONFIG`, 토큰은 `{env:PES_MCP_TOKEN}`, `oauth: false`) | 셸은 조사 도구(kosis · vworld · sgis · korean-law · kordoc · ego-browser)만, 파일 고치기 막음, 작업 폴더 밖 읽기 막음, 내 설정 폴더는 싣지 않음 |
 
 설치 스크립트가 Codex(`@openai/codex`) · OpenCode(`opencode-ai`)를 확인하고 없으면 받습니다 — macOS · Linux 는 `~/.pes/runtime`(npm `--prefix`), Windows 는 npm 전역(`%APPDATA%\npm`). 설치 뒤에 지운 경우에도 그 AI를 고른 계정이 일을 받으면 브리지가 다시 받습니다. **처음 한 번 로그인은 사람이 합니다**: `codex login` · `opencode auth login`. 준비 상태는 `node ~/.pes/bridge/worker/worker.mjs --check` 로 봅니다.
 
@@ -110,7 +110,8 @@ node ~/.pes/bridge/worker/worker.mjs --remove a2   # 계정 떼기(번호 또는
 - worker 의 Claude Code 는 허용한 도구만 씁니다: PES MCP · 웹 검색/읽기 · 스킬 · 파일 읽기, 그리고 `kosis` · `vworld` · `sgis` · `korean-law` · `kordoc` · `ego-browser` 로 시작하는 명령 하나씩(파이프 · `&&` · `;` 없이).
 - Claude Code 는 `--restricted` 로 돕니다(Claude Code 2.1 의 새 판부터 — 없는 판이면 예전 방식으로 돌고 로그에 업데이트하라고 남깁니다): 내 `~/.claude` 설정 · 훅 · 플러그인 · CLAUDE.md 가 브리지 일에 섞이지 않고, 파일 읽기는 작업 폴더(`~/.pes/work/<계정>`) · `~/.pes/docs` · 조사 도구 사용법 폴더(`~/.claude/skills/kosis` · `vworld` · `sgis` · ego-browser) 안으로만 됩니다. 토큰이 있는 계정 폴더는 읽지 못합니다.
 - 어느 AI든 작업 폴더는 토큰이 없는 빈 폴더(`~/.pes/work/<계정>`)입니다. 법령 값 `LAW_OC` 는 브리지가 `~/.claude/settings.json` 에서 읽어 환경 변수로 넘깁니다(Codex · OpenCode 도 법령 조회가 됩니다).
-- Codex 는 셸 명령을 이름으로 묶지 못합니다(작업 폴더 밖 쓰기만 막힘) — 「조사 도구 명령만」은 규칙에 기댑니다.
+- Codex 는 셸 명령을 이름으로 묶지 못합니다(「조사 도구 명령만」은 규칙에 기댑니다). 대신 셸이 닿는 곳을 좁힙니다(macOS · Linux, 권한 프로필이 있는 판): 내 홈 폴더는 읽지 못하고 작업 폴더 · `~/.pes/docs` · 조사 도구 폴더(`~/.kosis` · `~/.sgis` · `~/.vworld` · `~/.local` · `~/.pes/runtime` · 사용법 폴더)만 엽니다. PES 토큰은 셸 환경에서 빼고, 내 규칙(`~/.codex/rules`) · 훅은 싣지 않습니다. 채팅 · 다듬기 갈래는 인터넷도 끕니다. 이 샌드박스 안에서는 ego-browser 가 앱을 찾지 못해 돌지 않습니다. Windows 와 옛 판은 예전 방식(작업 폴더 밖 쓰기만 막힘)입니다.
+- OpenCode 는 내 설정 폴더(`~/.config/opencode` 의 MCP 서버 · 플러그인 · 명령)를 싣지 않고 모델 · 제공자 설정만 옮겨 옵니다. 작업 폴더 밖 파일은 `~/.pes/docs` · 조사 도구 사용법 폴더만 읽고, 채팅 · 다듬기 갈래는 셸 · 웹 읽기를 모두 막습니다.
 - **ego-browser 주의**: `ego-browser nodejs` 는 자바스크립트를 실행하므로 이 허용은 명령 제한이 아니라 규칙(공개 페이지 읽기만, 로그인 · 글쓰기 · 양식 제출 금지, 첨부는 `~/.pes/docs` 에만 저장)에 기댑니다. 반드시 로그인 없는 「PES」 프로필을 만들어 두세요.
 - 받은 원문 파일과 변환한 Markdown 은 `~/.pes/docs` 에 둡니다.
 
