@@ -220,6 +220,8 @@ function claudeModels(bin) {
     c.stdin.write(JSON.stringify({ type: 'control_request', request_id: 'models', request: { subtype: 'initialize' } }) + '\n')
   })
 }
+// Codex 의 내 기본 모델(~/.codex/config.toml 의 model) — 브리지는 Codex 를 --ignore-user-config 로 띄워 이 값을 읽지 않으니, 「기본」일 때 직접 넘긴다
+const codexModel = () => { try { return okModel(/^model\s*=\s*"([^"]+)"/m.exec(readFileSync(join(homedir(), '.codex', 'config.toml'), 'utf8'))?.[1]) } catch { return '' } }
 let catAt = 0, catalog = null
 async function modelCatalog() {
   if (catalog && Date.now() - catAt < 50 * 60_000) return catalog
@@ -241,7 +243,7 @@ async function modelCatalog() {
       if (ms.length) list.codex = ms.map((m) => ({ id: m.slug, name: m.display_name, note: m.description, efforts: (m.supported_reasoning_levels ?? []).map((x) => okEffort(typeof x === 'string' ? x : x?.effort)).filter(Boolean), effort: okEffort(m.default_reasoning_level) }))
     } catch {}
     ready.codex = /logged in/i.test(((r) => r.out + r.err)(await exec(cx, ['login', 'status'], 30_000)))
-    try { def.codex = okModel(/^model\s*=\s*"([^"]+)"/m.exec(readFileSync(join(homedir(), '.codex', 'config.toml'), 'utf8'))?.[1]) } catch {}
+    def.codex = codexModel()
   }
   const oc = which('opencode')
   if (oc) {
@@ -458,6 +460,8 @@ class Account {
    */
   async agent(kind, prompt, out, key, why, n, engine, pick = '', effort = '') {
     effort = okEffort(effort)
+    // Codex 「기본」: PES 화면이 보여 주는 기본 모델(내 설정의 model)로 돌린다 — 라운드 · 채팅 · 다듬기 모두
+    if (engine === 'codex' && !okModel(pick)) pick = codexModel()
     const slugs = slugsOf(out, kind === 'chat' ? ['chats'] : kind === 'polish' ? ['polish'] : ['start', 'new', 'open', 'review'])
     const label = `[${this.label}] ${kind === 'chat' ? '채팅 답' : kind === 'polish' ? '스킬대로 다듬기' : ENGINE_KO[engine]}`
     const bin = await ensureEngine(engine)
