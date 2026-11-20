@@ -370,7 +370,7 @@ class Account {
     this.running = false; this.again = false; this.timer = null
     this.chatting = false; this.chatAgain = false; this.chatTries = 0; this.chatRetry = null
     this.polishing = false; this.polishAgain = false
-    this.retry = 0; this.lastFail = 0; this.ws = null; this.ping = null; this.stopped = false
+    this.retry = 0; this.dead = false; this.ws = null; this.ping = null; this.stopped = false
   }
   log(...a) { log(`[${this.label}]`, ...a) }
   fileKey() { try { const k = readFileSync(this.keyFile, 'utf8').trim(); return /^pes_[a-z0-9]{20,}$/i.test(k) ? k : null } catch { return null } }
@@ -544,12 +544,11 @@ class Account {
   }
   async connect() {
     if (this.stopped) return
-    // 연결이 401 로 끊기면(토큰 만료 · 취소) 갱신부터
-    const key = await this.key(Date.now() - this.lastFail < 5000)
+    const key = await this.key()
     if (!key) { this.log(`키를 받지 못했어요 — 이 계정은 다시 붙여야 해요: node worker.mjs --remove ${this.id} 뒤 --add. 10분 뒤 다시 시도해요.`); setTimeout(() => void this.connect(), 10 * 60_000); return }
     const ws = new WebSocket(`${BASE.replace(/^http/, 'ws')}/mcp/live`, { headers: { authorization: `Bearer ${key}` } })
     this.ws = ws
-    ws.onopen = () => { this.retry = 0; this.log('PES 알림에 붙었어요'); this.ping = setInterval(() => { try { ws.send('ping') } catch {} }, 25_000); this.schedule('붙음 · 밀린 일 확인', 500); void this.runChats('붙음 · 밀린 채팅'); void this.runPolish('붙음 · 밀린 다듬기') }
+    ws.onopen = () => { this.retry = 0; this.dead = false; this.log('PES 알림에 붙었어요'); this.ping = setInterval(() => { try { ws.send('ping') } catch {} }, 25_000); this.schedule('붙음 · 밀린 일 확인', 500); void this.runChats('붙음 · 밀린 채팅'); void this.runPolish('붙음 · 밀린 다듬기') }
     ws.onmessage = (e) => {
       if (e.data === 'pong') return
       try {
@@ -564,11 +563,28 @@ class Account {
     ws.onclose = (e) => {
       clearInterval(this.ping)
       if (this.stopped) return
-      if (e.code === 1006) this.lastFail = Date.now()
+      if (e.code === 1006) { void this.failed(key); return } // 붙지 못함 — 키가 죽었는지부터 본다
       const wait = Math.min(60_000, 1000 * 2 ** this.retry++)
       this.log(`알림 연결 끊김(${e.code}) — ${Math.round(wait / 1000)}초 뒤 다시`); setTimeout(() => void this.connect(), wait)
     }
     ws.onerror = () => {}
+  }
+  /**
+   * 알림에 붙지 못했을 때(1006) — 키가 죽었는지(GET /mcp/me 가 401) 먼저 본다.
+   *   죽었으면 토큰을 갱신하고 바로 다시 붙는다. 갱신도 안 되면(다른 곳에서 새로 「허용」해 이 연결이 끊김 · 취소) 죽은 키로 1분마다 두드리지 않는다 —
+   *   다시 붙이라고 한 번 알리고 10분마다만 본다. 401 이 아니면(네트워크 · 서버) 예전처럼 1초~60초 간격으로 다시 붙는다.
+   */
+  async failed(key) {
+    if (this.stopped) return
+    const st = await fetch(`${BASE}/mcp/me`, { headers: { authorization: `Bearer ${key}` } }).then((r) => r.status).catch(() => 0)
+    if (st === 401) {
+      const tok = this.fileKey() ? null : readJson(this.tokenFile)
+      if (tok && await this.refresh(tok)) { this.retry = 0; setTimeout(() => void this.connect(), 1000); return }
+      if (!this.dead) this.log(`PES 가 이 연결을 받지 않아요(401) — 다른 곳에서 새로 「허용」했거나 연결이 취소됐어요. 이 계정은 다시 붙여야 해요: node worker.mjs --remove ${this.id} 뒤 --add. 10분마다 다시 확인해요.`)
+      this.dead = true; setTimeout(() => void this.connect(), 10 * 60_000); return
+    }
+    const wait = Math.min(60_000, 1000 * 2 ** this.retry++)
+    this.log(`알림 연결 끊김(1006) — ${Math.round(wait / 1000)}초 뒤 다시`); setTimeout(() => void this.connect(), wait)
   }
   stop() { this.stopped = true; clearTimeout(this.timer); clearTimeout(this.chatRetry); clearInterval(this.ping); try { this.ws?.close() } catch {} }
 }
