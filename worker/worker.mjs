@@ -26,6 +26,7 @@ import { mkdirSync, readFileSync, writeFileSync, chmodSync, statSync, existsSync
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { Vault, Relay, RELAY_TOOLS } from './relay.mjs'
 
 const BASE = process.env.PES_BASE || 'https://pes.seliq.kr'
 const DIR = join(homedir(), '.config', 'pes-bridge')
@@ -193,6 +194,10 @@ function skillDir(n) { try { const d = realpathSync(join(homedir(), '.claude', '
 const skillDirs = () => SKILL_NAMES.map(skillDir).filter(Boolean)
 const SKILL_RULE = () => { const l = ['kosis', 'vworld', 'sgis'].map((n) => [n, skillDir(n)]).filter((x) => x[1]); return l.length ? `
 5-0) 조사 도구를 처음 쓰기 전에 그 도구의 사용법 파일을 읽는다(읽기만 한다 — 그 폴더의 스크립트는 돌리지 않는다): ${l.map(([n, d]) => `${n} ${d}/SKILL.md`).join(' · ')}` : '' }
+// 조사 도구 키: PES 서버에 등록된 키를 받아(Vault) 이 프로세스의 메모리에만 두고, 로컬 중계(Relay)가 CLI 요청에 끼워 넣는다 — 규약은 RELAY.md.
+//   AI · CLI 에는 중계 주소와 그 실행에만 통하는 토큰만 간다(키는 가지 않는다). 예전 서버(키 내주기 없음)면 지금처럼 이 컴퓨터 CLI 의 키로 돈다.
+const relay = new Relay({ log: (...a) => log(...a) })
+const LOCAL_KEY_ENV = ['LAW_OC', 'KOREAN_LAW_API_KEY', 'KOSIS_API_KEY', 'KOSIS_API_KEYS', 'SGIS_CONSUMER_KEY', 'SGIS_CONSUMER_SECRET', 'SGIS_API_KEYS', 'VWORLD_API_KEYS', 'VWORLD_DOMAIN']
 // LAW_OC(법령 API 값)는 설치 때 ~/.claude/settings.json 의 env 에 넣는다 — --restricted 의 Claude Code 는 그 설정을 읽지 않고 Codex · OpenCode 는 원래 읽지 않으니, 브리지가 환경 변수로 넘긴다
 const CLAUDE_SETTINGS = join(homedir(), '.claude', 'settings.json')
 const loadLawOc = () => { if (process.env.LAW_OC) return; const v = readJson(CLAUDE_SETTINGS)?.env?.LAW_OC; if (v) process.env.LAW_OC = String(v) }
@@ -433,6 +438,7 @@ class Account {
     this.chatting = false; this.chatAgain = false; this.chatTries = 0; this.chatRetry = null
     this.polishing = false; this.polishAgain = false
     this.retry = 0; this.dead = false; this.ws = null; this.ping = null; this.stopped = false
+    this.vault = new Vault({ base: BASE, dir: this.dir, token: () => this.key(), log: (...a) => this.log(...a) })
   }
   log(...a) { log(`[${this.label}]`, ...a) }
   fileKey() { try { const k = readFileSync(this.keyFile, 'utf8').trim(); return /^pes_[a-z0-9]{20,}$/i.test(k) ? k : null } catch { return null } }
@@ -459,6 +465,22 @@ class Account {
    *   claude-code: 도구를 이름으로 묶는다(--allowedTools) · codex: 작업 폴더만 쓰기 + 인터넷 허용, 확인 없이 · opencode: 셸은 조사 도구만, 파일 고치기 막음
    */
   async agent(kind, prompt, out, key, why, n, engine, pick = '', effort = '') {
+    // 라운드 일: PES 에 등록된 키로 조사한다 — 키를 받아 중계를 열고, AI 에는 중계 주소 · 이 실행의 토큰 · 도구별 키 수만 준다
+    const round = kind !== 'chat' && kind !== 'polish'
+    const tk = round ? await this.vault.keys() : null
+    if (!tk) { if (round) loadLawOc(); return this.agentRun(kind, prompt, out, key, why, n, engine, pick, effort, process.env) }
+    const run = await relay.open(tk)
+    const penv = { ...process.env, ...run.env }
+    for (const k of LOCAL_KEY_ENV) delete penv[k] // 이 컴퓨터의 키는 넘기지 않는다(CLI 도 중계 모드에서는 쓰지 않는다)
+    this.log(`조사 도구 키(PES 등록): ${Object.keys(RELAY_TOOLS).map((t) => `${t} ${tk[t]?.keys?.length ?? 0}`).join(' · ')}`)
+    try { return await this.agentRun(kind, prompt, out, key, why, n, engine, pick, effort, penv) }
+    finally {
+      const u = relay.close(run.token)
+      const line = Object.entries(u).map(([t, a]) => `${t} ${a.map((c, i) => c ? `키${i + 1} ${c.calls}회${c.limited ? `(한도 ${c.limited})` : c.errors ? `(오류 ${c.errors})` : ''}` : '').filter(Boolean).join(' ')}`).join(' · ')
+      if (line) this.log(`조사 도구 사용: ${line}`)
+    }
+  }
+  async agentRun(kind, prompt, out, key, why, n, engine, pick, effort, penv) {
     effort = okEffort(effort)
     // Codex 「기본」: PES 화면이 보여 주는 기본 모델(내 설정의 model)로 돌린다 — 라운드 · 채팅 · 다듬기 모두
     if (engine === 'codex' && !okModel(pick)) pick = codexModel()
@@ -470,8 +492,7 @@ class Account {
     // 작업 폴더는 계정 폴더(토큰 · MCP 설정이 있다)가 아니라 빈 전용 폴더 — AI 의 파일 도구 · 셸이 토큰 파일 옆에서 돌지 않게
     const work = join(homedir(), '.pes', 'work', this.id)
     mkdirSync(work, { recursive: true }); mkdirSync(DOCS_DIR, { recursive: true })
-    loadLawOc()
-    const opts = { key, kind, slugs, label, cwd: work }
+    const opts = { key, kind, slugs, label, cwd: work, env: penv }
     if (engine === 'claude-code') {
       this.writeMcp(key)
       const round = kind !== 'chat' && kind !== 'polish'
@@ -483,7 +504,7 @@ class Account {
       return runAgent(engine, bin, prompt, ['-p', ...lock, '--mcp-config', this.mcpCfg, '--strict-mcp-config', '--allowedTools', ...(lock.length ? tools.filter((t) => t !== 'Skill') : tools), ...(typeof model === 'string' && model ? ['--model', model] : []), ...(effort ? ['--effort', effort] : []), ...STREAM], opts)
     }
     // 키는 파일에 적지 않고 환경 변수로만 넘긴다
-    const env = { ...process.env, PES_MCP_TOKEN: key }
+    const env = { ...penv, PES_MCP_TOKEN: key }
     const round = kind !== 'chat' && kind !== 'polish'
     if (engine === 'codex') {
       // Codex 는 셸 명령을 이름으로 묶지 못한다(규칙은 금지만, 기본 거절이 없다). 그래서 셸이 닿는 곳을 좁힌다:
