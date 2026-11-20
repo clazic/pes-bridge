@@ -349,7 +349,7 @@ const CHAT_PROMPT = `너는 PES(정책 연구보고서 작성 서비스)의 PES 
 2) 물음마다 get_project 로 그 프로젝트를 읽고(진행 방식은 progress · auto_mode 를 보고 그대로 말한다), 필요하면 list_items 로 항목도 읽고, answer_chat {slug, id, text} 로 한국어 3~8줄로 답한다. 인사에는 짧게 인사하고 지금 단계와 다음 할 일을 한 줄로 말한다. 항목은 #번호로 가리킨다.
 3) 같은 사람이 같은 말을 여러 번 보냈으면 마지막 것에만 내용을 담아 답하고, 나머지는 「위에 답했어요」처럼 한 줄로 답해 줄을 비운다.
 4) 내용을 고쳐 달라는 물음(「~로 고쳐 줘」 「~하게 작성해 줘」 「~ 빼 줘」)이면 미루지 말고 바로 고친다 — get_project 로 그 단계 상태를 보고:
-   · 승인 대기(waiting)면: get_item 으로 해당 항목을 읽고 update_item {slug, stage, id, title/summary/details, note} 로 그 자리에서 고친다(요청한 곳만, 나머지 글 · 표 · 출처 표시는 그대로). 고칠 항목이 여럿이면 모두 고친다. 그다음 answer_chat 으로 「n번을 이렇게 고쳤어요」처럼 고친 항목 번호와 바뀐 점을 답한다. 「다음 라운드에 반영하겠다」 「채팅에서는 답만 할 수 있다」고 하지 않는다.
+   · 승인 대기(waiting)면: 먼저 get_skill {slug, stage} 로 그 프로젝트의 보고서 작성 스킬과 단어 목록을 읽고(그 프로젝트에서 한 번만), 그 규칙대로 고친다. get_item 으로 해당 항목을 읽고 update_item {slug, stage, id, title/summary/details, note} 로 그 자리에서 고친다(요청한 곳만, 나머지 글 · 표 · 출처 표시는 그대로). 고칠 항목이 여럿이면 모두 고친다. 그다음 answer_chat 으로 「n번을 이렇게 고쳤어요」처럼 고친 항목 번호와 바뀐 점을 답한다. 「다음 라운드에 반영하겠다」 「채팅에서는 답만 할 수 있다」고 하지 않는다.
    · 작업 중(working)이면: 고치지 않고 지금 라운드가 끝나면 반영된다고 답한다. 완료(approved)면: 그 단계를 「다시 열기」해야 고칠 수 있다고 답한다.
 규칙: 마크다운 기호를 쓰지 않는다. 모르는 것은 지어내지 않는다. 단계 상태는 홈 화면 이름(예정 · 답변 대기 · 작업 중 · 승인 대기 · 완료)으로 말하고 「사람 차례」라고 하지 않는다.`
 // 「한글로 열기」 보고서 스킬대로 다듬기 전용(pending_work 의 polish) — 라운드 · 채팅과 따로, 빠른 모델로
@@ -411,7 +411,7 @@ class Account {
     if (engine === 'claude-code') {
       this.writeMcp(key)
       const round = kind !== 'chat' && kind !== 'polish'
-      const tools = kind === 'chat' ? ['mcp__pes__pending_work', 'mcp__pes__answer_chat', 'mcp__pes__get_project', 'mcp__pes__list_items', 'mcp__pes__get_item', 'mcp__pes__update_item'] : kind === 'polish' ? ['mcp__pes__pending_work', 'mcp__pes__get_polish', 'mcp__pes__submit_polish'] : ROUND_TOOLS
+      const tools = kind === 'chat' ? ['mcp__pes__pending_work', 'mcp__pes__answer_chat', 'mcp__pes__get_project', 'mcp__pes__list_items', 'mcp__pes__get_item', 'mcp__pes__update_item', 'mcp__pes__get_skill'] : kind === 'polish' ? ['mcp__pes__pending_work', 'mcp__pes__get_polish', 'mcp__pes__submit_polish'] : ROUND_TOOLS
       // --restricted: 내 설정 · 훅 · CLAUDE.md 를 읽지 않고, 파일 읽기는 작업 폴더 · 받은 원문 폴더 · 조사 도구 사용법 폴더 안으로만. 기본 도구는 --tools 로 이름을 댄 것만 남는다
       const lock = (await canRestrict(bin)) ? ['--restricted', '--tools', ...(round ? ['WebSearch', 'WebFetch', 'Read', 'Bash'] : ['Read']), ...(round ? ['--add-dir', DOCS_DIR, ...skillDirs()] : [])] : []
       // 라운드 모델: 내 설정(~/.claude/settings.json 의 model)을 --restricted 가 읽지 않으니 그 값을 직접 넘긴다
