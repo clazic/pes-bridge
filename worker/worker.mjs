@@ -425,7 +425,9 @@ class Account {
       //   · 토큰(PES_MCP_TOKEN)은 셸 환경에서 뺀다 — MCP 연결은 Codex 본체가 한다
       //   · 권한 프로필(되는 판 · macOS · Linux): 내 홈 폴더는 읽지 못하고, 작업 폴더 · 받은 원문 폴더 · 조사 도구 폴더만 연다. 채팅 · 다듬기는 인터넷도 끈다
       //   · 내 규칙(~/.codex/rules) · 훅은 싣지 않는다
-      const mcp = ['-c', `mcp_servers.pes.url="${BASE}/mcp"`, '-c', 'mcp_servers.pes.bearer_token_env_var="PES_MCP_TOKEN"', '-c', 'shell_environment_policy.exclude=["PES_MCP_TOKEN"]']
+      const mcp = ['-c', `mcp_servers.pes.url="${BASE}/mcp"`, '-c', 'mcp_servers.pes.bearer_token_env_var="PES_MCP_TOKEN"', '-c', 'shell_environment_policy.exclude=["PES_MCP_TOKEN"]',
+        // PES 도구 가운데 쓰는 것(answer_chat · merge_items …)은 Codex 가 승인을 묻는다 — 물을 사람이 없으니 PES 서버 도구는 승인 없이 쓰게 한다
+        '-c', 'mcp_servers.pes.default_tools_approval_mode="approve"']
       const head = ['exec', '--json', '--skip-git-repo-check', '--ignore-user-config', '-c', 'approval_policy="never"']
       if (await canProfile(bin)) {
         const home = homedir().replace(/\\/g, '/'), fs = { ':root': 'read', [home]: 'deny', ':workspace_roots': 'write', ':tmpdir': 'write' }
