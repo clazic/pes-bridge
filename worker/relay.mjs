@@ -22,6 +22,7 @@ const P256 = { name: 'ECDSA', namedCurve: 'P-256' }
 
 /** 서버가 내주는 도구 이름 → 중계 경로의 도구 이름 · 환경 변수 이름 */
 export const RELAY_TOOLS = { kosis: 'KOSIS', sgis: 'SGIS', vworld: 'VWORLD', law: 'LAW' }
+const KO = { kosis: 'KOSIS', sgis: 'SGIS', vworld: 'VWorld', law: '법령' } // 안내 글에 쓰는 이름(CLI 의 안내와 같게)
 /** 도구마다 보낼 수 있는 기관 호스트(그 이름이거나 그 아래 도메인) — 다른 곳으로는 보내지 않는다 */
 const HOSTS = {
   kosis: ['kosis.kr'],
@@ -153,7 +154,7 @@ export class Relay {
     const [, tool, , upHost, path = '/', query = ''] = m
     if (!RELAY_TOOLS[tool] || !hostOk(tool, upHost)) return this.fail(res, 403, `${tool} 중계로는 ${upHost} 에 보낼 수 없어요.`)
     const pool = run.pool[tool]
-    if (!pool.keys.length) return this.fail(res, 409, `PES 에 ${tool} 키가 없어요. PES 「조사 도구 · 그림 키」에서 키를 넣으세요.`)
+    if (!pool.keys.length) return this.fail(res, 409, `PES 에 ${KO[tool]} 키가 없어요. PES 「조사 도구 · 그림 키」에서 키를 넣으세요.`)
 
     // 자리표시 → 실제 값(어느 키를 썼는지 기억해 센다). enc: 값이 들어가는 자리에 맞게 바꾼다
     const used = new Set()

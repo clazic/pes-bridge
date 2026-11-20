@@ -77,9 +77,31 @@ function Vworld-N { if (-not (Have vworld)) { return 0 }; ([regex]::Matches((& v
 function Sgis-Ok { if (-not (Have sgis)) { return $false }; [bool](& sgis config get 2>$null | Where-Object { "$_" -match '^consumer_key:' -and "$_" -notmatch '미설정' }) }
 function Law-Oc { try { (Get-Content $Settings -Raw -Encoding UTF8 | ConvertFrom-Json).env.LAW_OC } catch { "" } }
 
+# PES 중계 모드(RELAY.md)를 아는 판인지 — 닿지 않는 중계 주소와 키 0개를 주면 새 판은 기관을 부르지 않고 「PES 에 … 키가 없어요」로 끝난다.
+# 옛 판이면 PES 에 등록한 키 대신 이 컴퓨터의 키로 돌기 때문에 새 판으로 올린다
+function Relay-Ok($t) {
+  $map = @{ 'kosis' = @('KOSIS', @('s', '인구', '-n', '1')); 'sgis' = @('SGIS', @('code', 'stage')); 'vworld' = @('VWORLD', @('geocode', '서울')); 'korean-law' = @('LAW', @('query', '민법')) }
+  if (-not $map.ContainsKey($t)) { return $true }
+  $name = "PES_RELAY_$($map[$t][0])_KEYS"
+  $old = @{ u = $env:PES_RELAY_URL; k = $env:PES_RELAY_TOKEN; n = [Environment]::GetEnvironmentVariable($name) }
+  try {
+    $env:PES_RELAY_URL = 'http://127.0.0.1:9'; $env:PES_RELAY_TOKEN = 'x'; [Environment]::SetEnvironmentVariable($name, '0')
+    $o = (& $t @($map[$t][1]) 2>&1 | Out-String)
+  } catch { $o = "$_" } finally {
+    $env:PES_RELAY_URL = $old.u; $env:PES_RELAY_TOKEN = $old.k; [Environment]::SetEnvironmentVariable($name, $old.n)
+  }
+  return [bool]($o -match 'PES 에 .*키가 없어요')
+}
+
 function Cmd-Install {
   foreach ($t in $Tools) {
-    if (Have $t) { Write-Output "OK $t $(Where-Is $t)"; continue }
+    if (Have $t) {
+      if (Relay-Ok $t) { Write-Output "OK $t $(Where-Is $t)"; continue }
+      Write-Output "... $t 새 판으로 올리는 중(PES 중계)"
+      Install-One $t
+      if (Relay-Ok $t) { Write-Output "INSTALLED $t 새 판" } else { Write-Output "FAIL $t 새 판으로 올리지 못했어요 — PES 에 등록한 키 대신 이 컴퓨터의 키로 돌아요" }
+      continue
+    }
     Write-Output "... $t 설치 중"
     Install-One $t
     if (Have $t) { Write-Output "INSTALLED $t" } else {

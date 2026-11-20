@@ -46,9 +46,28 @@ install_one() {
 }
 TOOLS="kosis vworld sgis korean-law kordoc"
 
+# PES 중계 모드(RELAY.md)를 아는 판인지 — 닿지 않는 중계 주소와 키 0개를 주면 새 판은 기관을 부르지 않고 「PES 에 … 키가 없어요」로 끝난다.
+# 옛 판이면 PES 에 등록한 키 대신 이 컴퓨터의 키로 돌기 때문에 새 판으로 올린다
+relay_ok() {
+  case "$1" in
+    kosis)      o=$(PES_RELAY_URL=http://127.0.0.1:9 PES_RELAY_TOKEN=x PES_RELAY_KOSIS_KEYS=0 kosis s 인구 -n 1 2>&1) ;;
+    sgis)       o=$(PES_RELAY_URL=http://127.0.0.1:9 PES_RELAY_TOKEN=x PES_RELAY_SGIS_KEYS=0 sgis code stage 2>&1) ;;
+    vworld)     o=$(PES_RELAY_URL=http://127.0.0.1:9 PES_RELAY_TOKEN=x PES_RELAY_VWORLD_KEYS=0 vworld geocode 서울 2>&1) ;;
+    korean-law) o=$(PES_RELAY_URL=http://127.0.0.1:9 PES_RELAY_TOKEN=x PES_RELAY_LAW_KEYS=0 korean-law query 민법 2>&1) ;;
+    *) return 0 ;;
+  esac
+  case "$o" in *"PES 에 "*"키가 없어요"*) return 0 ;; esac
+  return 1
+}
+
 cmd_install() {
   for t in $TOOLS; do
-    if have "$t"; then echo "OK $t $(command -v "$t")"; continue; fi
+    if have "$t"; then
+      if relay_ok "$t"; then echo "OK $t $(command -v "$t")"; continue; fi
+      echo "... $t 새 판으로 올리는 중(PES 중계)"
+      if install_one "$t" >/dev/null 2>&1 && relay_ok "$t"; then echo "INSTALLED $t 새 판"; else echo "FAIL $t 새 판으로 올리지 못했어요 — PES 에 등록한 키 대신 이 컴퓨터의 키로 돌아요"; fi
+      continue
+    fi
     echo "... $t 설치 중"
     if install_one "$t" >/dev/null 2>&1 && have "$t"; then echo "INSTALLED $t"; else echo "FAIL $t 설치하지 못했어요"; fi
   done
