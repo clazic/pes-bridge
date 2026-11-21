@@ -58,7 +58,7 @@ irm https://raw.githubusercontent.com/clazic/pes-bridge/main/install.ps1 | iex
 
 ### 쓸 AI 고르기 — Claude Code · Codex · OpenCode
 
-브리지는 **프로젝트마다** PES 에서 고른 AI로 일합니다 — 프로젝트 화면 맨 위 「작업 AI」 옆 「외부 AI 종류」에서 고르고, 따로 고르지 않은 프로젝트는 「외부 AI 연결」 창의 기본 AI가 맡습니다. 일을 받을 때마다 PES 가 일마다 맡을 AI를 알려 주므로, 바꾸면 다음 일부터 그 AI가 합니다. 한 번에 받은 일이 여러 AI 몫이면 AI별로 묶어 차례로 돌리고, 각 AI에게는 자기 몫 프로젝트만 맡깁니다.
+브리지는 **프로젝트마다** PES 에서 고른 AI로 일합니다 — 프로젝트 화면 맨 위 「작업 AI」 옆 「외부 AI 종류」에서 고르고, 따로 고르지 않은 프로젝트는 「외부 AI」 창의 기본 AI가 맡습니다. 일을 받을 때마다 PES 가 일마다 맡을 AI를 알려 주므로, 바꾸면 다음 일부터 그 AI가 합니다. 한 번에 받은 일이 여러 AI 몫이면 AI별로 묶어 차례로 돌리고, 각 AI에게는 자기 몫 프로젝트만 맡깁니다.
 
 | AI | 실행 | PES 연결 | 조사 도구 · 권한 |
 |---|---|---|---|
@@ -97,7 +97,7 @@ node ~/.pes/bridge/worker/worker.mjs --remove a2   # 계정 떼기(번호 또는
 
 ## 모델 바꾸기
 
-- 단계별 모델: PES 「외부 AI 연결」 창의 「단계별 모델」에서 AI(Claude Code · Codex · OpenCode)마다 기획 · 조사 · 분석·종합 · 집필 · 검증 · 산출 단계의 모델을 고릅니다. 브리지는 PES 에 붙을 때 이 컴퓨터에서 쓸 수 있는 모델 목록을 올리고(Claude Code 시작 응답 · `codex debug models` · `opencode models`, 6시간에 한 번 다시 읽음), 일마다 붙어 오는 `model` 로 돌립니다(`--model` · `-m` · 설정 `model`). 단계별 모델을 고른 계정은 한 번 실행이 지금 단계까지만 하고, 다음 단계는 그 단계의 모델로 새로 띄웁니다.
+- 단계별 모델: PES 「외부 AI」 창의 「단계별 모델」에서 AI(Claude Code · Codex · OpenCode)마다 기획 · 조사 · 분석·종합 · 집필 · 검증 · 산출 단계의 모델을 고릅니다. 브리지는 PES 에 붙을 때 이 컴퓨터에서 쓸 수 있는 모델 목록을 올리고(Claude Code 시작 응답 · `codex debug models` · `opencode models`, 6시간에 한 번 다시 읽음), 일마다 붙어 오는 `model` 로 돌립니다(`--model` · `-m` · 설정 `model`). 단계별 모델을 고른 계정은 한 번 실행이 지금 단계까지만 하고, 다음 단계는 그 단계의 모델로 새로 띄웁니다.
 - Codex 의 「기본」 모델: `~/.codex/config.toml` 의 `model` 입니다. 브리지는 Codex 를 내 설정을 읽지 않게(`--ignore-user-config`) 띄우므로 그 값을 읽어 `-m` 으로 넘깁니다(없으면 Codex 자체 기본 모델).
 - 단계별 AI: 같은 자리의 「단계별 AI」에서 단계마다 맡을 AI를 섞어 고를 수 있습니다(프로젝트에 AI를 따로 고르지 않았을 때). 브리지는 이 컴퓨터에 붙어 있는 AI(설치 + 로그인)를 붙을 때와 한 시간마다 알리고, PES 화면은 그 AI만 고르게 합니다.
 - 단계별 effort(생각 깊이): 같은 자리에서 단계마다 고릅니다. Claude Code 는 `--effort`, Codex 는 `-c model_reasoning_effort=`, OpenCode 는 `--model 모델#값` 으로 넘깁니다. OpenCode 는 모델마다 되는 값이 달라, 안 되는 값이면(`Variant unavailable`) effort 없이 다시 돌립니다.

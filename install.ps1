@@ -107,7 +107,7 @@ else {
   else { Warn "로그인이 필요해요 — PowerShell 에서 claude 를 한 번 실행해 로그인해 주세요" }
 }
 
-# Codex · OpenCode — PES 「외부 AI 연결」에서 쓸 AI로 고르면 이것으로 일한다. 없으면 npm 전역(%APPDATA%\npm)으로 받는다
+# Codex · OpenCode — PES 「외부 AI」에서 쓸 AI로 고르면 이것으로 일한다. 없으면 npm 전역(%APPDATA%\npm)으로 받는다
 foreach ($e in @(@{ n = "codex"; pkg = "@openai/codex"; login = "codex login" }, @{ n = "opencode"; pkg = "opencode-ai"; login = "opencode auth login" })) {
   $b = (Get-Command $e.n -ErrorAction SilentlyContinue | Select-Object -First 1).Source
   if ($b) { Ok "$($e.n) $(& $b --version 2>$null | Select-Object -First 1)"; continue }

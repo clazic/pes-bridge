@@ -57,7 +57,7 @@ else
   else echo "FAIL claude Claude Code 를 설치하지 못했어요 — https://claude.com/claude-code"; fi
 fi
 
-# ── Codex CLI · OpenCode (PES 「외부 AI 연결」에서 쓸 AI로 고르면 이것으로 일한다) — 없으면 npm 으로 ~/.pes/runtime 에 받는다 ──
+# ── Codex CLI · OpenCode (PES 「외부 AI」에서 쓸 AI로 고르면 이것으로 일한다) — 없으면 npm 으로 ~/.pes/runtime 에 받는다 ──
 for E in "codex:@openai/codex:codex login" "opencode:opencode-ai:opencode auth login"; do
   N=${E%%:*}; R=${E#*:}; PKG=${R%%:*}; LOGIN=${R#*:}
   if command -v "$N" >/dev/null 2>&1; then echo "OK $N $("$N" --version 2>/dev/null | head -1) ($(command -v "$N"))"

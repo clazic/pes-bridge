@@ -47,7 +47,7 @@ process.env.PATH = [...FIRST, process.env.PATH || (WIN ? '' : '/usr/bin:/bin')].
 const EXTS = WIN ? ['.exe', '.cmd', '.bat', ''] : ['']
 const which = (n) => { for (const d of process.env.PATH.split(SEP)) for (const x of EXTS) { const f = join(d, n + x); try { if (statSync(f).isFile()) return f } catch {} } return null }
 const CLAUDE = process.env.CLAUDE_BIN || which('claude') || (WIN ? 'claude.exe' : '/opt/homebrew/bin/claude')
-// ── 엔진: 프로젝트마다 PES 에서 고른 AI(pending_work 의 일마다 붙는 engine)로 돌린다. 따로 고르지 않은 프로젝트는 계정 기본 AI(「외부 AI 연결」 창 · GET /mcp/me 의 engine) ──
+// ── 엔진: 프로젝트마다 PES 에서 고른 AI(pending_work 의 일마다 붙는 engine)로 돌린다. 따로 고르지 않은 프로젝트는 계정 기본 AI(「외부 AI」 창 · GET /mcp/me 의 engine) ──
 //   claude-code: Claude Code(claude -p) · codex: Codex CLI(codex exec) · opencode: OpenCode(opencode run)
 //   Codex · OpenCode 가 없으면 이 컴퓨터의 npm 으로 받는다(macOS · Linux: ~/.pes/runtime, Windows: npm 전역 %APPDATA%\npm). 처음 한 번 로그인은 사람이 한다
 const ENGINE_KO = { 'claude-code': 'Claude Code', codex: 'Codex', opencode: 'OpenCode' }
@@ -201,7 +201,7 @@ const LOCAL_KEY_ENV = ['LAW_OC', 'KOREAN_LAW_API_KEY', 'KOSIS_API_KEY', 'KOSIS_A
 // LAW_OC(법령 API 값)는 설치 때 ~/.claude/settings.json 의 env 에 넣는다 — --restricted 의 Claude Code 는 그 설정을 읽지 않고 Codex · OpenCode 는 원래 읽지 않으니, 브리지가 환경 변수로 넘긴다
 const CLAUDE_SETTINGS = join(homedir(), '.claude', 'settings.json')
 const loadLawOc = () => { if (process.env.LAW_OC) return; const v = readJson(CLAUDE_SETTINGS)?.env?.LAW_OC; if (v) process.env.LAW_OC = String(v) }
-// ── 이 컴퓨터에서 쓸 수 있는 모델 목록 · 붙어 있는 AI — PES 「외부 AI 연결」 창이 이 목록에서 고른다(POST /mcp/models). 붙을 때와 한 시간마다 올린다 ──
+// ── 이 컴퓨터에서 쓸 수 있는 모델 목록 · 붙어 있는 AI — PES 「외부 AI」 창이 이 목록에서 고른다(POST /mcp/models). 붙을 때와 한 시간마다 올린다 ──
 //   Claude Code: 시작 응답(control initialize)의 models · Codex: codex debug models · OpenCode: opencode models
 const MODEL_ID = /^[A-Za-z0-9][\w.:/@[\]-]{0,79}$/
 const okModel = (v) => (typeof v === 'string' && MODEL_ID.test(v) ? v : '')
@@ -462,7 +462,7 @@ class Account {
     chmodSync(this.mcpCfg, 0o600)
   }
   /**
-   * 고른 엔진으로 프롬프트를 돌린다 — 엔진은 실행할 때마다 PES(GET /mcp/me)에 묻는다(PES 「외부 AI 연결」에서 바꾸면 다음 일부터 그 엔진)
+   * 고른 엔진으로 프롬프트를 돌린다 — 엔진은 실행할 때마다 PES(GET /mcp/me)에 묻는다(PES 「외부 AI」에서 바꾸면 다음 일부터 그 엔진)
    *   프로젝트마다 다른 AI를 고를 수 있다 — pending_work 의 일마다 붙는 engine 으로 묶어(byEngine) 묶음마다 그 AI를 띄운다
    *   claude-code: 도구를 이름으로 묶는다(--allowedTools) · codex: 작업 폴더만 쓰기 + 인터넷 허용, 확인 없이 · opencode: 셸은 조사 도구만, 파일 고치기 막음
    */
@@ -471,7 +471,7 @@ class Account {
     const round = kind !== 'chat' && kind !== 'polish'
     const tk = round ? await this.vault.keys() : null
     if (!tk) { if (round) loadLawOc(); return this.agentRun(kind, prompt, out, key, why, n, engine, pick, effort, process.env) }
-    // 외부 AI 의 「그림 · 표 점검」(PES 「외부 AI 연결」 창에서 켠 계정): Jev 판단은 AI 를 띄우기 전에 브리지가 직접 받아 서버에 넘긴다
+    // 외부 AI 의 「그림 · 표 점검」(PES 「외부 AI」 창에서 켠 계정): Jev 판단은 AI 를 띄우기 전에 브리지가 직접 받아 서버에 넘긴다
     await this.placeJev(out, tk, key).catch((e) => this.log(`Jev 판단 오류 — ${String(e?.message ?? e).slice(0, 120)}`))
     const run = await relay.open(tk, { pes: { base: BASE, token: () => this.key() } })
     const penv = { ...process.env, ...run.env }
@@ -591,7 +591,7 @@ class Account {
   }
   /**
    * 할 일을 맡을 AI별로 묶는다 — 일마다 붙은 engine(프로젝트에 고른 AI, 없으면 계정 기본 AI). 예전 서버라 engine 이 없으면 계정 기본 AI(GET /mcp/me)
-   * 라운드 일은 모델 · effort 까지 같은 것끼리 묶는다 — 일마다 붙은 model · effort(PES 「외부 AI 연결」 창의 「단계별 모델」, 없으면 이 컴퓨터의 기본 모델)
+   * 라운드 일은 모델 · effort 까지 같은 것끼리 묶는다 — 일마다 붙은 model · effort(PES 「외부 AI」 창의 「단계별 모델」, 없으면 이 컴퓨터의 기본 모델)
    * 돌려주는 것: [{ engine, model, part(그 AI · 모델 몫만 담은 pending_work 꼴), n(건수), only(프롬프트에 붙일 「이 프로젝트만」 줄) }]
    */
   async byEngine(kind, out, key) {
@@ -611,7 +611,7 @@ class Account {
         only: stop + `\n맡은 프로젝트: 이번 실행은 slug ${slugs.join(' · ')} 만 맡는다. pending_work 에 다른 프로젝트가 보여도 읽거나 고치지 않는다(프로젝트마다 맡는 AI가 따로 있다). 남은 일을 다시 볼 때도 이 프로젝트만 본다.` }
     })
   }
-  /** 이 컴퓨터의 모델 목록을 PES 에 올린다 — 「외부 AI 연결」 창의 「단계별 모델」이 이 목록에서 고른다 */
+  /** 이 컴퓨터의 모델 목록을 PES 에 올린다 — 「외부 AI」 창의 「단계별 모델」이 이 목록에서 고른다 */
   async sendModels(key, quiet = false) {
     try {
       const c = await modelCatalog()
