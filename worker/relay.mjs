@@ -7,7 +7,10 @@
 //   2) Relay: 127.0.0.1 에 연 중계. CLI 는 기관 서버 대신 여기로 자리표시(__PES_KEY_0__ …)를 넣어 보내고, 중계가 실제 키로 바꿔 기관 서버(HTTPS)로 보낸다.
 //      · 실행마다 새 토큰(open → close) — 실행이 끝나면 그 토큰은 죽는다. AI 가 토큰을 봐도 그 실행 동안 기관 API 를 부를 수 있을 뿐 키는 얻지 못한다.
 //      · 도구마다 정해진 기관 호스트로만 보낸다(다른 곳으로 키가 실린 요청을 보내게 할 수 없다). 응답에 실제 키가 섞여 오면 자리표시로 바꾼다.
-//      · 키마다 호출 수를 센다(usage) — 실행이 끝날 때 브리지가 로그에 남긴다.
+//      · 키마다 호출 수를 센다(usage) — 실행이 끝날 때 브리지가 로그에 남기고 PES 에 올린다.
+//   3) 그림 · Jev(외부 AI 의 「그림 · 표 점검」, PES 「외부 AI 연결」 창에서 켠 계정): 키는 AI 에 주지 않고 이 프로세스가 직접 부른다.
+//      · 그림: 중계가 여는 로컬 MCP 도구 make_image(/mcp/<실행 토큰>) — 내 Vertex 키로 그려 PES 에 올리고(POST /mcp/upload) 파일 주소를 준다. 한 실행에 MAX_IMAGES 장까지.
+//      · Jev: jevAsk() — 브리지(worker.mjs)가 라운드를 띄우기 전에 서버가 준 질문으로 부른다(AI 를 거치지 않는다).
 import http from 'node:http'
 import https from 'node:https'
 import { randomBytes, timingSafeEqual, webcrypto } from 'node:crypto'
@@ -101,7 +104,7 @@ export class Vault {
   async report(usage) {
     try {
       const list = {}
-      for (const [t, a] of Object.entries(usage ?? {})) { const x = a.filter((c) => c?.id && c.calls); if (x.length) list[t] = x.map(({ id, calls, errors, limited }) => ({ id, calls, errors, limited })) }
+      for (const [t, a] of Object.entries(usage ?? {})) { const x = a.filter((c) => c?.id && c.calls); if (x.length) list[t] = x.map(({ id, calls, errors, limited, tokens }) => ({ id, calls, errors: errors ?? 0, limited: limited ?? 0, ...(tokens ? { tokens } : {}) })) }
       if (!Object.keys(list).length) return false
       const token = await this.token()
       if (!token || !(await this.bind(token))) return false
@@ -118,6 +121,30 @@ const HOP = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-au
 const PH = /__PES_(KEY|SECRET)_(\d+)__|__PES_DOMAIN__/g
 const TEXTY = /^(text\/|application\/(json|xml|javascript|x-www-form-urlencoded|[\w.+-]*\+(json|xml)))/i
 const MAX_BODY = 8 << 20 // 자리표시를 바꾸려고 통째로 읽는 요청 본문 한도
+const MAX_IMAGES = 8 // 한 실행에 만들 수 있는 그림 수(외부 AI 가 과하게 부르지 않게)
+const VERTEX_MODEL = 'gemini-2.5-flash-image'
+const JEV_URL = 'https://api.typesafe.ai/v1/systemone', JEV_MODEL = 'jev-latest'
+const jsonReq = async (url, headers, body, ms) => {
+  const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), ms)
+  try { const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body), signal: ctl.signal }); return { status: r.status, text: await r.text() } }
+  catch (e) { return { status: 0, text: String(e?.message ?? e) } } finally { clearTimeout(t) }
+}
+/**
+ * Jev(TypeSafe) 판단 한 번 — tool: Vault.keys().jev({keys, base_url?, model?}). 돌려주는 것: {answers, tokens, id(쓴 키 번호), ok}
+ * 키는 이 프로세스에서만 쓴다(AI 를 거치지 않는다). 실패하면 다음 키로 한 번 더
+ */
+export async function jevAsk(tool, state, questions) {
+  const keys = (tool?.keys ?? []).filter((k) => k?.key)
+  let last = { answers: null, tokens: 0, id: keys[0]?.id ?? 0, ok: false, limited: false, error: 'Jev 키가 없어요' }
+  for (const k of keys.slice(0, 2)) {
+    const r = await jsonReq(tool.base_url || JEV_URL, { authorization: `Bearer ${k.key}` }, { model: tool.model || JEV_MODEL, state, questions }, 30_000)
+    let d = null; try { d = JSON.parse(r.text) } catch {}
+    const tokens = Object.entries(d?.usage ?? {}).reduce((n, [key, v]) => n + (/token/i.test(key) && Number.isFinite(Number(v)) ? Number(v) : 0), 0)
+    last = { answers: r.status === 200 ? (d?.answers ?? {}) : null, tokens, id: k.id ?? 0, ok: r.status === 200, limited: r.status === 429, error: r.status === 200 ? '' : `HTTP ${r.status}` }
+    if (last.ok) break
+  }
+  return last
+}
 const same = (a, b) => { const x = Buffer.from(String(a)), y = Buffer.from(String(b)); return x.length === y.length && timingSafeEqual(x, y) }
 
 export class Relay {
@@ -132,21 +159,23 @@ export class Relay {
     })
   }
   /** 실행 하나를 연다 — tools: Vault.keys() 결과. 돌려주는 env 를 AI 프로세스에 준다(키는 없다) */
-  async open(tools) {
+  async open(tools, extra = {}) { // extra.pes: {base, token()} — make_image 가 그린 그림을 PES 에 올릴 때 쓴다
     await this.listen()
     const token = randomBytes(32).toString('base64url')
     const pool = {}
     for (const t of Object.keys(RELAY_TOOLS)) pool[t] = { keys: (tools?.[t]?.keys ?? []).filter((k) => k?.key), domain: String(tools?.[t]?.extra ?? '') }
-    this.runs.set(token, { pool, usage: {} })
+    this.runs.set(token, { pool, usage: {}, vertex: tools?.vertex ?? null, pes: extra.pes ?? null, images: 0, turn: 0 })
     const env = { PES_RELAY_URL: `http://127.0.0.1:${this.port}`, PES_RELAY_TOKEN: token }
     for (const [t, E] of Object.entries(RELAY_TOOLS)) env[`PES_RELAY_${E}_KEYS`] = String(pool[t].keys.length)
-    return { token, env }
+    // 로컬 MCP(make_image): 내 Vertex 그림 키가 있을 때만 — 주소에 이 실행의 토큰이 들어 있다(실행이 끝나면 죽는다)
+    const draw = (tools?.vertex?.keys ?? []).some((k) => k?.key) && !!extra.pes
+    return { token, env, mcp: draw ? `http://127.0.0.1:${this.port}/mcp/${token}` : null }
   }
   /** 실행을 닫는다 → 그 실행의 키별 호출 수 {도구: [{id(서버의 키 번호), calls, errors, limited}]} — 자리(키 차례)마다, 안 쓴 자리는 빈칸 */
   close(token) {
     const r = this.runs.get(token); this.runs.delete(token)
     const out = {}
-    for (const [t, a] of Object.entries(r?.usage ?? {})) out[t] = Array.from(a, (c, i) => (c ? { id: r.pool[t].keys[i]?.id ?? 0, ...c } : null))
+    for (const [t, a] of Object.entries(r?.usage ?? {})) out[t] = Array.from(a, (c, i) => (c ? { id: (t === 'vertex' ? r.vertex?.keys : r.pool[t]?.keys)?.[i]?.id ?? 0, ...c } : null))
     return out
   }
   stop() { try { this.server?.close() } catch {} this.server = null; this.runs.clear() }
@@ -163,6 +192,14 @@ export class Relay {
     // (사전 요청 OPTIONS 에 답하지 않는다). Origin 머리글만으로는 막지 않는다 — CLI 가 기관에 보내는 Origin(국세법령정보)도 있다
     const host = String(req.headers.host ?? '')
     if (host !== `127.0.0.1:${this.port}` || req.method === 'OPTIONS' || req.headers['sec-fetch-site']) return this.fail(res, 403, '이 주소로는 중계하지 않아요.')
+    // 로컬 MCP(make_image) — 주소의 토큰으로 실행을 찾는다
+    const mm = /^\/mcp\/([A-Za-z0-9_-]{20,})$/.exec(req.url ?? '')
+    if (mm) {
+      let r = null
+      for (const [t, x] of this.runs) if (same(t, mm[1])) r = x
+      if (!r) return this.fail(res, 401, '중계 토큰이 맞지 않아요(실행이 끝났을 수 있어요).')
+      return this.mcp(req, res, r)
+    }
     const tok = String(req.headers['x-pes-relay-token'] ?? '')
     let run = null
     for (const [t, r] of this.runs) if (same(t, tok)) run = r
@@ -237,5 +274,60 @@ export class Relay {
       up.on('error', (e) => { this.fail(res, 502, `기관 서버에 닿지 않아요: ${String(e?.message ?? e).slice(0, 120)}`); done() })
       if (body) up.end(body); else if (req.method === 'GET' || req.method === 'HEAD') up.end(); else req.pipe(up)
     })
+  }
+
+  // ── 로컬 MCP: make_image 하나(Streamable HTTP 의 가장 단순한 꼴 — 요청마다 JSON 으로 답한다) ──
+  async mcp(req, res, run) {
+    if (req.method !== 'POST') { res.writeHead(405, { allow: 'POST' }); return res.end() }
+    const chunks = []; let n = 0
+    for await (const c of req) { n += c.length; if (n > 1 << 20) return this.fail(res, 413, '요청이 너무 커요.'); chunks.push(c) }
+    let msg = null; try { msg = JSON.parse(Buffer.concat(chunks).toString('utf8')) } catch {}
+    const send = (obj) => { const b = Buffer.from(JSON.stringify(obj)); res.writeHead(200, { 'content-type': 'application/json', 'content-length': b.length, 'cache-control': 'no-store' }); res.end(b) }
+    const one = async (m) => {
+      if (!m || typeof m !== 'object' || m.id === undefined) return null // 알림(notifications/…)에는 답하지 않는다
+      const ok = (result) => ({ jsonrpc: '2.0', id: m.id, result })
+      if (m.method === 'initialize') return ok({ protocolVersion: m.params?.protocolVersion ?? '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'pes_local', version: '1' }, instructions: 'PES 브리지의 로컬 도구. make_image 로 보고서에 넣을 그림 한 장을 만든다(내 Vertex 그림 키).' })
+      if (m.method === 'ping') return ok({})
+      if (m.method === 'tools/list') return ok({ tools: [{ name: 'make_image', description: '정책 연구보고서에 넣을 그림 한 장을 만든다(가로 16:9, 내 Vertex 그림 키). PES 의 「그림 · 표 점검」 지시문이 시킬 때만 쓴다. 돌려주는 url 을 판정의 illust.image 에 넣는다.', inputSchema: { type: 'object', properties: { slug: { type: 'string', description: '프로젝트 slug' }, name: { type: 'string', description: '그림 제목' }, prompt: { type: 'string', description: '그림 지시 글(지시문의 틀 그대로)' } }, required: ['slug', 'name', 'prompt'] } }] })
+      if (m.method === 'tools/call') {
+        if (m.params?.name !== 'make_image') return { jsonrpc: '2.0', id: m.id, error: { code: -32602, message: '없는 도구예요.' } }
+        const r = await this.image(run, m.params?.arguments ?? {})
+        return ok({ isError: !r.ok, content: [{ type: 'text', text: JSON.stringify(r.ok ? { url: r.url, 넣는법: '판정의 "illust":{"prompt":"그릴 내용","image":"' + r.url + '"}', 주의: 'AI 가 만든 그림이다. 사실 · 수치 근거로 쓰지 않는다.' } : { error: r.error }) }] })
+      }
+      return { jsonrpc: '2.0', id: m.id, error: { code: -32601, message: '지원하지 않는 메서드예요.' } }
+    }
+    if (Array.isArray(msg)) { const out = (await Promise.all(msg.map(one))).filter(Boolean); if (!out.length) { res.writeHead(202); return res.end() } return send(out) }
+    const out = await one(msg)
+    if (!out) { res.writeHead(202); return res.end() }
+    send(out)
+  }
+  /** 그림 한 장: Vertex generateContent(키는 머리글로만) → PES 에 올리기 → {ok, url} */
+  async image(run, a) {
+    const keys = (run.vertex?.keys ?? []).filter((k) => k?.key)
+    const slug = String(a.slug ?? ''), name = String(a.name ?? '').slice(0, 60) || '그림', prompt = String(a.prompt ?? '').slice(0, 2000)
+    if (!keys.length || !run.pes) return { ok: false, error: '내 Vertex 그림 키가 없어요(PES 「조사 도구 · 그림 키」).' }
+    if (!/^[a-z0-9][a-z0-9-]{1,59}$/.test(slug) || prompt.length < 4) return { ok: false, error: 'slug · prompt 가 맞지 않아요.' }
+    if (run.images >= MAX_IMAGES) return { ok: false, error: `이번 실행에 만들 수 있는 그림 수(${MAX_IMAGES}장)를 넘었어요.` }
+    run.images++
+    const proj = String(run.vertex.extra ?? '').trim().replace(/^projects\//, ''), model = run.vertex.model || VERTEX_MODEL
+    const url = proj ? `https://aiplatform.googleapis.com/v1/projects/${encodeURIComponent(proj)}/locations/global/publishers/google/models/${model}:generateContent` : `https://aiplatform.googleapis.com/v1/publishers/google/models/${model}:generateContent`
+    const u = (run.usage.vertex ??= [])
+    let err = '그림을 만들지 못했어요.'
+    for (let t = 0; t < Math.min(2, keys.length); t++) {
+      const i = run.turn++ % keys.length, c = (u[i] ??= { calls: 0, errors: 0, limited: 0 })
+      c.calls++
+      const r = await jsonReq(url, { 'x-goog-api-key': keys[i].key }, { contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: { responseModalities: ['IMAGE'], imageConfig: { aspectRatio: '16:9' } } }, 120_000)
+      let d = null; try { d = JSON.parse(r.text) } catch {}
+      const parts = (Array.isArray(d) ? d[0] : d)?.candidates?.[0]?.content?.parts ?? []
+      const img = parts.find((x) => x?.inlineData?.data)
+      if (r.status !== 200 || !img) { c.errors++; if (r.status === 429) c.limited++; err = r.status === 429 ? '요청 한도를 넘었어요(HTTP 429). 잠시 뒤 다시 하세요.' : r.status === 200 ? '그림을 받지 못했어요.' : `Vertex AI HTTP ${r.status}`; continue }
+      const mime = img.inlineData.mimeType || 'image/png', bytes = Buffer.from(img.inlineData.data, 'base64')
+      const token = await run.pes.token()
+      const up = await fetch(`${run.pes.base}/mcp/upload?slug=${encodeURIComponent(slug)}&name=${encodeURIComponent(name)}`, { method: 'POST', headers: { 'content-type': mime, authorization: `Bearer ${token}` }, body: bytes }).catch(() => null)
+      const j = up ? await up.json().catch(() => null) : null
+      if (!up?.ok || !j?.url) return { ok: false, error: `그림을 PES 에 올리지 못했어요 — ${j?.error ?? `HTTP ${up?.status ?? 0}`}` }
+      return { ok: true, url: j.url }
+    }
+    return { ok: false, error: err }
   }
 }

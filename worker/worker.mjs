@@ -26,7 +26,7 @@ import { mkdirSync, readFileSync, writeFileSync, chmodSync, statSync, existsSync
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { Vault, Relay, RELAY_TOOLS } from './relay.mjs'
+import { Vault, Relay, RELAY_TOOLS, jevAsk } from './relay.mjs'
 
 const BASE = process.env.PES_BASE || 'https://pes.seliq.kr'
 const DIR = join(homedir(), '.config', 'pes-bridge')
@@ -406,6 +406,7 @@ const PROMPT = `너는 PES(정책 연구보고서 작성 서비스)의 PES 브�
 3) start(시작 질문 차례): get_start_questions → 주제와 앞 단계에 맞게 고른다(근거 없으면 recommended) → answer_start_questions → start_round.
 4) new: start_round. open: 이미 시작한 라운드를 이어 간다.
 5) start_round 가 준 instructions · context 대로 일한다. items 에 request(사용자 지시)가 있는 항목은 이번 라운드에 반드시 그 지시대로 고쳐 merge_items 로 넣는다. 사실 · 수치는 이 컴퓨터의 조사 도구로 먼저 확인한다 — 통계는 kosis, 주소 · 좌표 · 용도지역 · 공간정보는 vworld, 인구 · 가구 · 주택 · 사업체 통계지리 · 행정경계는 sgis, 법령 · 조문 · 조례 · 행정규칙은 korean-law(예: korean-law query 민법 제1조). Bash 로 그 명령 하나만 부른다(파이프 · && · ; 없이). 조사 도구로 안 되는 것만 WebSearch · WebFetch 로 원문을 확인한다. PES 서버의 조사 도구는 쓰지 않는다. sources 의 url 은 원 기관 주소(kosis.kr · vworld.kr · sgis.mods.go.kr · law.go.kr …)로 단다. merge_items 로 항목을 넣고 submit_round 로 마친다. 점검 질문은 개수를 정해 두지 말고 이번 결과에 남은 빈 곳 · 갈림길을 모두 꼽아 하나에 하나씩(어느 단계 · 라운드든 개수를 미리 정하지 않는다 — 지금 결과에 남은 빈 곳이 하나면 1개, 여럿이면 여러 개, 없으면 0개(많아야 8개)), 아직 답을 받지 않은 것만, 중요한 것부터.
+5-3) 산출 단계에서 start_round 의 instructions 에 「그림 · 표 점검」이 있으면 그대로 한다 — get_place_jobs → 장마다 get_place_job → submit_place. 그림은 지시문이 시킬 때 pes_local 의 make_image 로만 만들고(없으면 그 판정은 no_data), place 항목을 merge_items 로 직접 만들지 않는다.
 6) review(점검 차례): list_items 로 결과를 읽는다. 사용자가 남긴 항목 지시(request)가 있는 항목이 하나라도 있으면 승인하지 말고 answer_review 로 다음 라운드를 열어 그 지시부터 처리한다(라운드 수와 상관없이). 지시가 없고, 빈 곳이 없거나 이 단계 라운드가 3 이상이면 approve_stage. 아니면 answer_review(점검 질문 답 + 고칠 항목 지시) → start_round 로 다음 라운드.
 7) 처리한 뒤 pending_work 를 다시 부르고, 남은 일이 있으면 이어서 한다. 비면 끝낸다.
 규칙: 화면에 보이는 글에는 마크다운 기호를 쓰지 않는다. 지어낸 사실 · 수치 · 출처는 쓰지 않는다. 확인하지 못한 것은 「확인하지 못함」.`
@@ -455,8 +456,9 @@ class Account {
     if (tok && (force || tok.exp - Date.now() < 86_400_000)) tok = (await this.refresh(tok)) ?? (tok.exp > Date.now() ? tok : null)
     return tok?.access ?? null
   }
-  writeMcp(key) {
-    writeFileSync(this.mcpCfg, JSON.stringify({ mcpServers: { pes: { type: 'http', url: `${BASE}/mcp`, headers: { Authorization: `Bearer ${key}` } } } }, null, 2))
+  writeMcp(key, local = null) {
+    // pes_local: 브리지의 로컬 도구(make_image) — 주소에 그 실행의 토큰이 들어 있다. 내 Vertex 그림 키가 있는 라운드에만
+    writeFileSync(this.mcpCfg, JSON.stringify({ mcpServers: { pes: { type: 'http', url: `${BASE}/mcp`, headers: { Authorization: `Bearer ${key}` } }, ...(local ? { pes_local: { type: 'http', url: local } } : {}) } }, null, 2))
     chmodSync(this.mcpCfg, 0o600)
   }
   /**
@@ -469,11 +471,13 @@ class Account {
     const round = kind !== 'chat' && kind !== 'polish'
     const tk = round ? await this.vault.keys() : null
     if (!tk) { if (round) loadLawOc(); return this.agentRun(kind, prompt, out, key, why, n, engine, pick, effort, process.env) }
-    const run = await relay.open(tk)
+    // 외부 AI 의 「그림 · 표 점검」(PES 「외부 AI 연결」 창에서 켠 계정): Jev 판단은 AI 를 띄우기 전에 브리지가 직접 받아 서버에 넘긴다
+    await this.placeJev(out, tk, key).catch((e) => this.log(`Jev 판단 오류 — ${String(e?.message ?? e).slice(0, 120)}`))
+    const run = await relay.open(tk, { pes: { base: BASE, token: () => this.key() } })
     const penv = { ...process.env, ...run.env }
     for (const k of LOCAL_KEY_ENV) delete penv[k] // 이 컴퓨터의 키는 넘기지 않는다(CLI 도 중계 모드에서는 쓰지 않는다)
     this.log(`조사 도구 키(PES 등록): ${Object.keys(RELAY_TOOLS).map((t) => `${t} ${tk[t]?.keys?.length ?? 0}`).join(' · ')}`)
-    try { return await this.agentRun(kind, prompt, out, key, why, n, engine, pick, effort, penv) }
+    try { return await this.agentRun(kind, prompt, out, key, why, n, engine, pick, effort, penv, run.mcp) }
     finally {
       const u = relay.close(run.token)
       const line = Object.entries(u).map(([t, a]) => `${t} ${a.map((c, i) => c ? `키${i + 1} ${c.calls}회${c.limited ? `(한도 ${c.limited})` : c.errors ? `(오류 ${c.errors})` : ''}` : '').filter(Boolean).join(' ')}`).join(' · ')
@@ -481,7 +485,34 @@ class Account {
       void this.vault.report(u) // PES 「조사 도구 · 그림 키」 창의 키별 사용량에 더한다
     }
   }
-  async agentRun(kind, prompt, out, key, why, n, engine, pick, effort, penv) {
+  /**
+   * 산출 단계 일감의 Jev 판단 — 서버가 준 질문(POST /mcp/place-jev)을 내 Jev 키로 물어 답을 돌려준다(두 단계). 서버는 Jev 를 부르지 않는다.
+   * 옵션이 꺼져 있거나 Jev 키가 없으면 아무것도 하지 않는다(그러면 Jev 없이 점검한다)
+   */
+  async placeJev(out, tk, key) {
+    if (!(tk?.jev?.keys ?? []).length) return
+    const slugs = [...new Set(['start', 'new', 'open'].flatMap((k) => (Array.isArray(out?.[k]) ? out[k] : []).filter((x) => x?.stage === 'publish').map((x) => x.slug)).filter(Boolean))]
+    const post = async (body) => { const r = await fetch(`${BASE}/mcp/place-jev`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` }, body: JSON.stringify(body) }).catch(() => null); return r?.ok ? r.json().catch(() => null) : null }
+    const use = new Map() // 키 번호 → {calls, errors, limited, tokens}
+    const count = (r) => { const c = use.get(r.id) ?? { id: r.id, calls: 0, errors: 0, limited: 0, tokens: 0 }; c.calls++; if (!r.ok) c.errors++; if (r.limited) c.limited++; c.tokens += r.tokens; use.set(r.id, c) }
+    for (const slug of slugs) {
+      const list = await post({ slug })
+      if (!list?.on || !list.sections?.length) continue
+      let done = 0
+      for (const section_id of list.sections) {
+        const q1 = await post({ slug, section_id })
+        if (!q1?.q) continue
+        const r1 = await jevAsk(tk.jev, q1.q.state, q1.q.questions); count(r1)
+        if (!r1.ok) break // 키 · 한도 문제면 이 프로젝트는 Jev 없이 점검한다
+        const q2 = await post({ slug, section_id, a1: r1.answers })
+        if (q2?.q) { const r2 = await jevAsk(tk.jev, q2.q.state, q2.q.questions); count(r2); await post({ slug, section_id, a1: r1.answers, a2: r2.ok ? r2.answers : {} }) }
+        done++
+      }
+      this.log(`그림 · 표 점검: ${slug} Jev 판단 ${done}/${list.sections.length}장`)
+    }
+    if (use.size) void this.vault.report({ jev: [...use.values()] })
+  }
+  async agentRun(kind, prompt, out, key, why, n, engine, pick, effort, penv, local = null) {
     effort = okEffort(effort)
     // Codex 「기본」: PES 화면이 보여 주는 기본 모델(내 설정의 model)로 돌린다 — 라운드 · 채팅 · 다듬기 모두
     if (engine === 'codex' && !okModel(pick)) pick = codexModel()
@@ -495,9 +526,9 @@ class Account {
     mkdirSync(work, { recursive: true }); mkdirSync(DOCS_DIR, { recursive: true })
     const opts = { key, kind, slugs, label, cwd: work, env: penv }
     if (engine === 'claude-code') {
-      this.writeMcp(key)
       const round = kind !== 'chat' && kind !== 'polish'
-      const tools = kind === 'chat' ? ['mcp__pes__pending_work', 'mcp__pes__answer_chat', 'mcp__pes__get_project', 'mcp__pes__list_items', 'mcp__pes__get_item', 'mcp__pes__update_item', 'mcp__pes__get_skill'] : kind === 'polish' ? ['mcp__pes__pending_work', 'mcp__pes__get_polish', 'mcp__pes__submit_polish'] : ROUND_TOOLS
+      this.writeMcp(key, round ? local : null)
+      const tools = kind === 'chat' ? ['mcp__pes__pending_work', 'mcp__pes__answer_chat', 'mcp__pes__get_project', 'mcp__pes__list_items', 'mcp__pes__get_item', 'mcp__pes__update_item', 'mcp__pes__get_skill'] : kind === 'polish' ? ['mcp__pes__pending_work', 'mcp__pes__get_polish', 'mcp__pes__submit_polish'] : [...ROUND_TOOLS, ...(local ? ['mcp__pes_local'] : [])]
       // --restricted: 내 설정 · 훅 · CLAUDE.md 를 읽지 않고, 파일 읽기는 작업 폴더 · 받은 원문 폴더 · 조사 도구 사용법 폴더 안으로만. 기본 도구는 --tools 로 이름을 댄 것만 남는다
       const lock = (await canRestrict(bin)) ? ['--restricted', '--tools', ...(round ? ['WebSearch', 'WebFetch', 'Read', 'Bash'] : ['Read']), ...(round ? ['--add-dir', DOCS_DIR, ...skillDirs()] : [])] : []
       // 라운드 모델: PES 「단계별 모델」에서 고른 것(pick), 없으면 내 설정(~/.claude/settings.json 의 model — --restricted 가 읽지 않으니 그 값을 직접 넘긴다)
@@ -514,7 +545,8 @@ class Account {
       //   · 내 규칙(~/.codex/rules) · 훅은 싣지 않는다
       const mcp = ['-c', `mcp_servers.pes.url="${BASE}/mcp"`, '-c', 'mcp_servers.pes.bearer_token_env_var="PES_MCP_TOKEN"', '-c', 'shell_environment_policy.exclude=["PES_MCP_TOKEN"]',
         // PES 도구 가운데 쓰는 것(answer_chat · merge_items …)은 Codex 가 승인을 묻는다 — 물을 사람이 없으니 PES 서버 도구는 승인 없이 쓰게 한다
-        '-c', 'mcp_servers.pes.default_tools_approval_mode="approve"']
+        '-c', 'mcp_servers.pes.default_tools_approval_mode="approve"',
+        ...(round && local ? ['-c', `mcp_servers.pes_local.url="${local}"`, '-c', 'mcp_servers.pes_local.default_tools_approval_mode="approve"'] : [])]
       const head = ['exec', '--json', '--skip-git-repo-check', '--ignore-user-config', '-c', 'approval_policy="never"', ...(okModel(pick) ? ['-m', pick] : []), ...(effort ? ['-c', `model_reasoning_effort="${effort}"`] : [])] // -m · model_reasoning_effort: PES 「단계별 모델」에서 고른 모델 · effort
       if (await canProfile(bin)) {
         const home = homedir().replace(/\\/g, '/'), fs = { ':root': 'read', [home]: 'deny', ':workspace_roots': 'write', ':tmpdir': 'write' }
@@ -542,7 +574,7 @@ class Account {
     const cfg = join(this.dir, `opencode-${round ? 'round' : kind}.json`) // 갈래마다 따로 — 라운드와 채팅이 함께 돌아도 서로 덮지 않게
     writeFileSync(cfg, JSON.stringify({ $schema: 'https://opencode.ai/config.json', ...carry, ...(okModel(pick) ? { model: pick } : {}), // PES 「단계별 모델」에서 고른 모델이 내 설정의 모델보다 먼저
       // oauth: false — OpenCode 가 이 서버에 자체 로그인(OAuth)을 시도하지 않고 머리글의 키를 쓰게
-      mcp: { pes: { type: 'remote', url: `${BASE}/mcp`, headers: { Authorization: 'Bearer {env:PES_MCP_TOKEN}' }, oauth: false, enabled: true } },
+      mcp: { pes: { type: 'remote', url: `${BASE}/mcp`, headers: { Authorization: 'Bearer {env:PES_MCP_TOKEN}' }, oauth: false, enabled: true }, ...(round && local ? { pes_local: { type: 'remote', url: local, oauth: false, enabled: true } } : {}) },
       permission: { edit: 'deny', webfetch: round ? 'allow' : 'deny', external_directory: outside, bash } }, null, 2))
     chmodSync(cfg, 0o600)
     const xdg = join(DIR, 'opencode-home'); mkdirSync(xdg, { recursive: true })
