@@ -100,7 +100,7 @@ export class Vault {
       return tools
     } catch (e) { this.log(`조사 도구 키 받기 오류 — ${String(e?.message ?? e).slice(0, 120)}`); this.off = now + 60_000; return null }
   }
-  /** 로컬 중계가 센 키별 호출 수를 서버에 올린다(「조사 도구 · 그림 키」 창의 사용량) — 기기 키로 서명. 실패해도 일에는 지장 없다 */
+  /** 로컬 중계가 센 키별 호출 수를 서버에 올린다(「도구」 창의 사용량) — 기기 키로 서명. 실패해도 일에는 지장 없다 */
   async report(usage) {
     try {
       const list = {}
@@ -209,7 +209,7 @@ export class Relay {
     const [, tool, , upHost, path = '/', query = ''] = m
     if (!RELAY_TOOLS[tool] || !hostOk(tool, upHost)) return this.fail(res, 403, `${tool} 중계로는 ${upHost} 에 보낼 수 없어요.`)
     const pool = run.pool[tool]
-    if (!pool.keys.length) return this.fail(res, 409, `PES 에 ${KO[tool]} 키가 없어요. PES 「조사 도구 · 그림 키」에서 키를 넣으세요.`)
+    if (!pool.keys.length) return this.fail(res, 409, `PES 에 ${KO[tool]} 키가 없어요. PES 「도구」에서 키를 넣으세요.`)
 
     // 자리표시 → 실제 값(어느 키를 썼는지 기억해 센다). enc: 값이 들어가는 자리에 맞게 바꾼다
     const used = new Set()
@@ -305,7 +305,7 @@ export class Relay {
   async image(run, a) {
     const keys = (run.vertex?.keys ?? []).filter((k) => k?.key)
     const slug = String(a.slug ?? ''), name = String(a.name ?? '').slice(0, 60) || '그림', prompt = String(a.prompt ?? '').slice(0, 2000)
-    if (!keys.length || !run.pes) return { ok: false, error: '내 Vertex 그림 키가 없어요(PES 「조사 도구 · 그림 키」).' }
+    if (!keys.length || !run.pes) return { ok: false, error: '내 Vertex 그림 키가 없어요(PES 「도구」).' }
     if (!/^[a-z0-9][a-z0-9-]{1,59}$/.test(slug) || prompt.length < 4) return { ok: false, error: 'slug · prompt 가 맞지 않아요.' }
     if (run.images >= MAX_IMAGES) return { ok: false, error: `이번 실행에 만들 수 있는 그림 수(${MAX_IMAGES}장)를 넘었어요.` }
     run.images++

@@ -27,7 +27,7 @@ CLI 를 PES 밖에서 직접 쓸 때(아래 환경 변수가 없을 때)는 지�
    - 키와 짝인 비밀(SGIS 보안 Key): `__PES_SECRET_0__` … (같은 번호가 한 쌍)
    - VWorld 등록 도메인(domain 인자 · Referer): `__PES_DOMAIN__`
 3. **키 수가 0 이거나 변수가 없으면** 기관을 부르지 않고 이렇게 알리고 0 이 아닌 코드로 끝난다:
-   `PES 에 <도구 이름> 키가 없어요. PES 「조사 도구 · 그림 키」에서 키를 넣으세요.`
+   `PES 에 <도구 이름> 키가 없어요. PES 「도구」에서 키를 넣으세요.`
 4. **기관으로 가는 모든 HTTP(S) 요청을 중계로 보낸다.** 원래 주소 `<scheme>://<host>[:port]/<path>?<query>` 는
 
    `{PES_RELAY_URL}/<tool>/<scheme>/<host>[:port]/<path>?<query>`
