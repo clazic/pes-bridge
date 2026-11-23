@@ -123,6 +123,14 @@ const TEXTY = /^(text\/|application\/(json|xml|javascript|x-www-form-urlencoded|
 const MAX_BODY = 8 << 20 // 자리표시를 바꾸려고 통째로 읽는 요청 본문 한도
 const MAX_IMAGES = 8 // 한 실행에 만들 수 있는 그림 수(외부 AI 가 과하게 부르지 않게)
 const VERTEX_MODEL = 'gemini-2.5-flash-image'
+/** Vertex 오류를 사람이 읽는 말로 — Google 이 알린 까닭(상태 · 사유 · 글)을 붙인다. proj: 프로젝트 ID 를 넣어 불렀는지(PES src/integrations.ts vertexErr 와 같은 꼴) */
+const vertexErr = (status, e, proj) => {
+  const why = [e?.status, e?.details?.find((x) => x?.reason)?.reason].filter(Boolean).join(' · ')
+  const said = e?.message ? ` — Google: ${String(e.message).slice(0, 160)}` : ''
+  if (status === 401 || status === 403) return `키가 맞지 않거나 권한이 없어요 (HTTP ${status}${why ? ` ${why}` : ''})${said}${proj && status === 401 ? ' — 이 키가 프로젝트 주소에서는 통하지 않아요. PES 「도구」에서 프로젝트 ID 를 비우면 express 주소로 불러요.' : ''}`
+  if (status === 404) return '모델이나 프로젝트를 찾지 못했어요 (HTTP 404). 프로젝트 ID · 모델 이름을 확인하세요.'
+  return `Vertex AI HTTP ${status}${why ? ` ${why}` : ''}${said}`
+}
 const JEV_URL = 'https://api.typesafe.ai/v1/systemone', JEV_MODEL = 'jev-latest'
 const jsonReq = async (url, headers, body, ms) => {
   const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), ms)
@@ -320,7 +328,7 @@ export class Relay {
       let d = null; try { d = JSON.parse(r.text) } catch {}
       const parts = (Array.isArray(d) ? d[0] : d)?.candidates?.[0]?.content?.parts ?? []
       const img = parts.find((x) => x?.inlineData?.data)
-      if (r.status !== 200 || !img) { c.errors++; if (r.status === 429) c.limited++; err = r.status === 429 ? '요청 한도를 넘었어요(HTTP 429). 잠시 뒤 다시 하세요.' : r.status === 200 ? '그림을 받지 못했어요.' : `Vertex AI HTTP ${r.status}`; continue }
+      if (r.status !== 200 || !img) { c.errors++; if (r.status === 429) c.limited++; err = r.status === 429 ? '요청 한도를 넘었어요(HTTP 429). 잠시 뒤 다시 하세요.' : r.status === 200 ? '그림을 받지 못했어요.' : vertexErr(r.status, Array.isArray(d) ? d[0]?.error : d?.error, !!proj); continue }
       const mime = img.inlineData.mimeType || 'image/png', bytes = Buffer.from(img.inlineData.data, 'base64')
       const token = await run.pes.token()
       const up = await fetch(`${run.pes.base}/mcp/upload?slug=${encodeURIComponent(slug)}&name=${encodeURIComponent(name)}`, { method: 'POST', headers: { 'content-type': mime, authorization: `Bearer ${token}` }, body: bytes }).catch(() => null)
