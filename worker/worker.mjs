@@ -789,7 +789,7 @@ class Account {
     ws.onclose = (e) => {
       clearInterval(this.ping)
       if (this.stopped) return
-      if (e.code === 4003) { this.log(`PES 관리자가 이 컴퓨터를 막아 연결이 끊겼어요${e.reason ? ` — ${e.reason}` : ''}. 10분마다 다시 확인해요`); setTimeout(() => void this.connect(), 10 * 60_000); return }
+      if (e.code === 4003) { this.log(`PES 관리자가 이 컴퓨터를 막아 연결이 끊겼어요${e.reason ? ` — ${String(e.reason).replace(/\.$/, '')}` : ''}. 10분마다 다시 확인해요`); setTimeout(() => void this.connect(), 10 * 60_000); return }
       if (e.code === 1006) { void this.failed(key); return } // 붙지 못함 — 키가 죽었는지부터 본다
       const wait = Math.min(60_000, 1000 * 2 ** this.retry++)
       this.log(`알림 연결 끊김(${e.code}) — ${Math.round(wait / 1000)}초 뒤 다시`); setTimeout(() => void this.connect(), wait)
