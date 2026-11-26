@@ -119,7 +119,7 @@ node ~/.pes/bridge/worker/worker.mjs --remove a2   # 계정 떼기(번호 또는
 
 ## 멈춤 감지 시간 바꾸기
 
-환경 변수(분)로 바꿉니다: `PES_BRIDGE_IDLE_MIN`(응답 없음, 기본 10) · `PES_BRIDGE_ROUND_MAX_MIN`(라운드 상한, 기본 120) · `PES_BRIDGE_CHAT_MAX_MIN` · `PES_BRIDGE_POLISH_MAX_MIN`(기본 20).
+환경 변수(분)로 바꿉니다: `PES_BRIDGE_IDLE_MIN`(응답 없음, 기본 10) · `PES_BRIDGE_ROUND_MAX_MIN`(라운드 상한, 기본 120) · `PES_BRIDGE_CHAT_MAX_MIN`(채팅 답 상한, 기본 60 — 붙인 문서의 그림을 하나씩 다 보므로) · `PES_BRIDGE_POLISH_MAX_MIN`(기본 20).
 
 ## 안전
 
