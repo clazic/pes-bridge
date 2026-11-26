@@ -56,7 +56,9 @@ const BRIDGE_VERSION = '2026.11.26-device' // 판 — PES 「PES 브리지 컴�
 
 /**
  * 이 컴퓨터 정보 — 알림에 붙기 전에 PES 에 알린다(POST /mcp/computer). PES 관리자가 컴퓨터마다 쓰게 · 못 쓰게 정한다.
- *   machine: 하드웨어 UUID(macOS IOPlatformUUID · Windows MachineGuid · Linux machine-id)의 sha256 앞 32자 — UUID 자체는 보내지 않는다
+ *   machine: 하드웨어 UUID(macOS IOPlatformUUID · Windows MachineGuid · Linux machine-id)의 sha256 앞 32자 — UUID 자체는 보내지 않는다.
+ *     UUID 를 못 읽으면 ~/.config/pes-bridge/machine-id 에 처음 한 번 만든 무작위 ID 를 쓴다. 컴퓨터 이름 · MAC 은 ID 에 쓰지 않는다(이름을 바꿔도 같은 컴퓨터).
+ *     그 파일은 설치 폴더 밖이라 다시 설치해도 남고, 지우기는 PES_BRIDGE_PURGE=1 일 때만 지운다
  *   그 밖: 컴퓨터 이름 · 로그인 사용자명 · MAC 주소(내부용 · 가상 아닌 인터페이스) · OS · 판 · CPU · 브리지 판 · Node 판 · 깔린 AI
  */
 const run1 = (cmd, args) => new Promise((ok) => execFile(cmd, args, { timeout: 5000, windowsHide: true }, (e, so) => ok(e ? '' : String(so))))
@@ -68,6 +70,12 @@ async function deviceInfo() {
   if (p === 'darwin') hw = (/"IOPlatformUUID" = "([^"]+)"/.exec(await run1('/usr/sbin/ioreg', ['-rd1', '-c', 'IOPlatformExpertDevice'])) ?? [])[1] ?? ''
   else if (p === 'win32') hw = (/MachineGuid\s+REG_SZ\s+(\S+)/i.exec(await run1('reg', ['query', 'HKLM\\SOFTWARE\\Microsoft\\Cryptography', '/v', 'MachineGuid'])) ?? [])[1] ?? ''
   else { for (const f of ['/etc/machine-id', '/var/lib/dbus/machine-id']) { try { hw = readFileSync(f, 'utf8').trim(); if (hw) break } catch {} } }
+  if (!hw.trim()) { // 하드웨어 UUID 를 못 읽음 — 저장해 둔 ID, 없으면 새로 만들어 둔다
+    const f = join(DIR, 'machine-id')
+    try { hw = readFileSync(f, 'utf8').trim() } catch {}
+    if (!/^[a-f0-9]{32,64}$/i.test(hw)) { hw = randomBytes(32).toString('hex'); try { mkdirSync(DIR, { recursive: true }); writeFileSync(f, hw + '\n', { mode: 0o600 }) } catch {} }
+    hw = `saved:${hw}`
+  }
   const macs = []
   // macOS 는 Node 에 MAC 을 02:00:00:00:00:00 으로 감춘다 — 하드웨어 포트 목록(networksetup)에서 장치 주소를 읽는다
   if (p === 'darwin') for (const m of (await run1('/usr/sbin/networksetup', ['-listallhardwareports'])).matchAll(/Device: (\S+)\s*\nEthernet Address: ([0-9a-f:]{17})/gi)) if (!/^0[02]:00:00:00:00:00$/.test(m[2]) && !/^bridge/.test(m[1]) && !macs.some((x) => x.mac === m[2].toLowerCase())) macs.push({ iface: m[1], mac: m[2].toLowerCase() })
@@ -78,7 +86,7 @@ async function deviceInfo() {
   if (p === 'darwin') osVer = (await run1('/usr/bin/sw_vers', ['-productVersion'])).trim() || osVer
   let user = ''; try { user = userInfo().username } catch {}
   DEVICE = {
-    machine: createHash('sha256').update(`pes-bridge:${hw || `${hostname()}|${primary}`}`).digest('hex').slice(0, 32),
+    machine: createHash('sha256').update(`pes-bridge:${hw}`).digest('hex').slice(0, 32),
     hostname: hostname(), os_user: user, macs, primary_mac: primary, platform: p, os_version: osVer, arch: osArch(), bridge_ver: BRIDGE_VERSION, node_ver: process.version,
     engines: Object.entries(ENGINE_BIN).filter(([, b]) => which(b)).map(([e]) => e),
   }
