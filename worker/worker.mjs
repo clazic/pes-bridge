@@ -22,8 +22,8 @@
 import { spawn, execFile } from 'node:child_process'
 import { createServer } from 'node:http'
 import { createHash, randomBytes } from 'node:crypto'
-import { mkdirSync, readFileSync, writeFileSync, chmodSync, statSync, existsSync, readdirSync, renameSync, rmSync, realpathSync } from 'node:fs'
-import { homedir, hostname, userInfo, networkInterfaces, platform as osPlatform, arch as osArch, release as osRelease } from 'node:os'
+import { mkdirSync, readFileSync, writeFileSync, chmodSync, statSync, existsSync, readdirSync, renameSync, rmSync, realpathSync, cpSync, mkdtempSync } from 'node:fs'
+import { homedir, hostname, userInfo, networkInterfaces, tmpdir, platform as osPlatform, arch as osArch, release as osRelease } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Vault, Relay, RELAY_TOOLS, jevAsk } from './relay.mjs'
@@ -52,7 +52,11 @@ const CLAUDE = process.env.CLAUDE_BIN || which('claude') || (WIN ? 'claude.exe' 
 //   Codex · OpenCode 가 없으면 이 컴퓨터의 npm 으로 받는다(macOS · Linux: ~/.pes/runtime, Windows: npm 전역 %APPDATA%\npm). 처음 한 번 로그인은 사람이 한다
 const ENGINE_KO = { 'claude-code': 'Claude Code', codex: 'Codex', opencode: 'OpenCode' }
 const ENGINE_BIN = { 'claude-code': 'claude', codex: 'codex', opencode: 'opencode' }
-const BRIDGE_VERSION = '2026.11.26-device' // 판 — PES 「PES 브리지 컴퓨터」 기록에 보인다
+const BRIDGE_VERSION = '2026.11.26-update' // 판 — PES 「PES 브리지 컴퓨터」 기록에 보인다
+const ROOT = dirname(dirname(fileURLToPath(import.meta.url))) // 설치 폴더(~/.pes/bridge)
+const REV_FILE = join(ROOT, '.rev') // 스스로 업데이트할 때 적는 GitHub 커밋 번호
+const REV = (() => { try { const v = readFileSync(REV_FILE, 'utf8').trim(); return /^[0-9a-f]{40}$/.test(v) ? v : '' } catch { return '' } })()
+const BRIDGE_VER = REV ? `${BRIDGE_VERSION}+${REV.slice(0, 7)}` : BRIDGE_VERSION // PES 에 알리는 판(커밋 번호 앞 7자를 붙인다)
 
 /**
  * 이 컴퓨터 정보 — 알림에 붙기 전에 PES 에 알린다(POST /mcp/computer). PES 관리자가 컴퓨터마다 쓰게 · 못 쓰게 정한다.
@@ -87,7 +91,7 @@ async function deviceInfo() {
   let user = ''; try { user = userInfo().username } catch {}
   DEVICE = {
     machine: createHash('sha256').update(`pes-bridge:${hw}`).digest('hex').slice(0, 32),
-    hostname: hostname(), os_user: user, macs, primary_mac: primary, platform: p, os_version: osVer, arch: osArch(), bridge_ver: BRIDGE_VERSION, node_ver: process.version,
+    hostname: hostname(), os_user: user, macs, primary_mac: primary, platform: p, os_version: osVer, arch: osArch(), bridge_ver: BRIDGE_VER, node_ver: process.version,
     engines: Object.entries(ENGINE_BIN).filter(([, b]) => which(b)).map(([e]) => e),
   }
   return DEVICE
@@ -861,7 +865,68 @@ async function sync() {
   }
 }
 
+// ── 스스로 업데이트 — 켤 때 · 30분마다 GitHub main 의 최신 커밋을 보고, 깔린 것(.rev)과 다르면 쉬는 중에 받아 덮어쓴 뒤 끝낸다 ──
+// 끝내면 macOS 는 launchd, Windows 는 run.vbs 가 새 코드로 다시 켠다. 받은 판은 덮어쓰기 전에 실제로 한 번 띄워 본다(--version) — 안 뜨면 예전 판 그대로.
+// 끄기: PES_BRIDGE_NO_UPDATE=1. 개발 폴더(.git 이 있는 곳)에서는 하지 않는다. install.sh · install.ps1 이 하는 일(자동 실행 등록 · 실행 환경)은 바꾸지 못한다 — 그때는 설치 명령을 다시.
+const REPO = process.env.PES_BRIDGE_REPO || 'clazic/pes-bridge'
+const REF = process.env.PES_BRIDGE_REF || 'main' // 따라갈 가지(시험용)
+const UPDATE_OFF = process.env.PES_BRIDGE_NO_UPDATE === '1' || existsSync(join(ROOT, '.git'))
+const UPDATE_EVERY = 30 * 60_000
+const SHA = /^[0-9a-f]{40}$/
+let revTag = '', revSeen = '', revNext = 0, updating = false
+const busy = () => [...live.values()].some((a) => a.running || a.chatting || a.polishing || a.enriching)
+/** GitHub main 의 최신 커밋 번호. API(한 IP 에 한 시간 60번)가 막히면 커밋 피드로 묻는다. 모르면 '' */
+async function latestRev() {
+  try {
+    const r = await fetch(`https://api.github.com/repos/${REPO}/commits/${REF}`, { headers: { accept: 'application/vnd.github.sha', 'user-agent': 'pes-bridge', ...(revTag ? { 'if-none-match': revTag } : {}) }, signal: AbortSignal.timeout(15_000) })
+    if (r.status === 304) return revSeen
+    if (r.ok) { const v = (await r.text()).trim(); if (SHA.test(v)) { revTag = r.headers.get('etag') ?? ''; return (revSeen = v) } }
+  } catch {}
+  try {
+    const r = await fetch(`https://github.com/${REPO}/commits/${REF}.atom`, { headers: { 'user-agent': 'pes-bridge' }, signal: AbortSignal.timeout(15_000) })
+    const v = r.ok ? (await r.text()).match(/Commit\/([0-9a-f]{40})/)?.[1] : null
+    if (v) return (revSeen = v)
+  } catch {}
+  return ''
+}
+/** 그 커밋을 받아 확인하고 설치 폴더에 덮어쓴다. 됐으면 true */
+async function applyUpdate(rev) {
+  const tmp = mkdtempSync(join(tmpdir(), 'pes-bridge-up-'))
+  try {
+    const r = await fetch(`https://codeload.github.com/${REPO}/tar.gz/${rev}`, { headers: { 'user-agent': 'pes-bridge' }, signal: AbortSignal.timeout(120_000) })
+    if (!r.ok) throw new Error(`받기 HTTP ${r.status}`)
+    const tgz = join(tmp, 'src.tgz'), src = join(tmp, 'src')
+    writeFileSync(tgz, Buffer.from(await r.arrayBuffer())); mkdirSync(src)
+    const x = await exec('tar', ['-xzf', tgz, '-C', src, '--strip-components', '1'], 60_000)
+    if (x.code !== 0) throw new Error(`풀기 실패: ${x.err.trim().split('\n')[0]}`)
+    const nw = join(src, 'worker', 'worker.mjs')
+    if (!existsSync(nw) || !readFileSync(nw, 'utf8').includes("'--version'")) throw new Error('받은 판에 worker.mjs(--version)가 없어요')
+    // 새 판을 실제로 띄워 본다 — 문법 · import · 맨 위 코드가 도는지. 판 글자가 나와야 통과
+    const t = await new Promise((res) => execFile(process.execPath, [nw, '--version'], { timeout: 30_000, windowsHide: true, env: { ...process.env, PES_BRIDGE_NO_UPDATE: '1' } }, (e, so, se) => res({ ok: !e && /^\d{4}\.\d+\.\d+/.test(String(so).trim()), out: `${so ?? ''}${se ?? ''}`.trim() })))
+    if (!t.ok) throw new Error(`새 판이 뜨지 않아요: ${t.out.split('\n').slice(-1)[0] || '출력 없음'}`)
+    if (busy()) { log('업데이트를 미뤄요 — 받는 사이에 일이 들어왔어요'); return false }
+    rmSync(tgz, { force: true })
+    cpSync(src, ROOT, { recursive: true, force: true }) // 덮어쓰기만(run.vbs · .rev 같은 설치 폴더의 다른 파일은 그대로)
+    writeFileSync(REV_FILE, rev + '\n')
+    return true
+  } finally { try { rmSync(tmp, { recursive: true, force: true }) } catch {} }
+}
+async function checkUpdate() {
+  if (UPDATE_OFF || updating) return
+  updating = true
+  try {
+    const now = Date.now()
+    if (now >= revNext) { revNext = now + UPDATE_EVERY; await latestRev() }
+    if (!revSeen || revSeen === REV || busy()) return // 일하는 중이면 다음 확인(1분 뒤) 때 다시 본다
+    log(`새 판이 있어요(${revSeen.slice(0, 7)}${REV ? ` ← ${REV.slice(0, 7)}` : ''}) — 받아요`)
+    const rev = revSeen; revSeen = ''; revTag = '' // 실패하면 다음 30분 확인 때 다시
+    if (await applyUpdate(rev)) { log(`업데이트했어요(${rev.slice(0, 7)}) — 새 판으로 다시 켜져요`); for (const a of live.values()) a.stop(); process.exit(0) }
+  } catch (e) { log('업데이트하지 못했어요 — 예전 판으로 계속해요:', e?.message ?? e) } finally { updating = false }
+}
+
 // ── 명령 ──
+// node worker.mjs --version : 판만 보이고 끝낸다(업데이트할 때 새 판이 뜨는지 이것으로 본다)
+if (process.argv.includes('--version')) { console.log(BRIDGE_VER); process.exit(0) }
 const arg = (n) => { const i = process.argv.indexOf(n); return i >= 0 ? (process.argv[i + 1] ?? '') : null }
 // node worker.mjs --check : 연결하지 않고 이 컴퓨터의 준비 상태(claude · 조사 도구 · 키 · ego-browser)만 보이고 끝낸다
 if (process.argv.includes('--check')) {
@@ -917,9 +982,11 @@ if (process.argv.includes('--remove')) {
   process.exit(0)
 }
 
+await checkUpdate() // 켤 때 새 판이 있으면 먼저 바꾸고 다시 켜진다(로그인 · 연결보다 먼저)
 migrate()
 // 붙은 계정이 하나도 없으면 처음처럼 브라우저 「허용」으로 첫 계정을 붙인다
 if (!accountIds().length) { try { await oauthLogin(join(ACC, 'a1')) } catch (e) { log('로그인 연결 실패:', e.message) } }
+setInterval(() => void checkUpdate(), 60_000) // 1분마다 보되 GitHub 에는 30분마다 묻는다(일하는 중이라 미룬 업데이트는 쉬게 되면 바로)
 void ensureTools(true) // 켤 때 조사 도구 확인 · 설치(알림 연결과 따로)
 void egoCheck() // ego-browser 전용 프로필 확인
 await sync()

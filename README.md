@@ -90,8 +90,10 @@ node ~/.pes/bridge/worker/worker.mjs --remove a2   # 계정 떼기(번호 또는
 | API 키 다시 넣기 | `sh ~/.pes/bridge/worker/tools.sh keys` | `powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\.pes\bridge\worker\tools.ps1" keys` |
 | 준비 상태 점검(연결 없이) | `node ~/.pes/bridge/worker/worker.mjs --check` | `node "$env:USERPROFILE\.pes\bridge\worker\worker.mjs" --check` |
 | 도구 · 키 상태 | `sh ~/.pes/bridge/worker/tools.sh check` | `powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\.pes\bridge\worker\tools.ps1" check` |
-| 업데이트 | 설치 명령을 다시 실행 | 설치 명령을 다시 실행 |
+| 업데이트 | 스스로(아래) · 바로 하려면 설치 명령을 다시 실행 | 스스로(아래) · 바로 하려면 설치 명령을 다시 실행 |
 | 지우기 | `curl -fsSL https://raw.githubusercontent.com/clazic/pes-bridge/main/uninstall.sh \| sh` | `irm https://raw.githubusercontent.com/clazic/pes-bridge/main/uninstall.ps1 \| iex` |
+
+**스스로 업데이트** — 브리지는 켤 때와 30분마다 이 저장소 `main` 의 최신 커밋을 확인하고, 깔린 것과 다르면 쉬는 중(라운드 · 채팅 · 다듬기가 없을 때)에 받아 `~/.pes/bridge` 에 덮어쓴 뒤 스스로 다시 켜집니다. 받은 판은 덮어쓰기 전에 한 번 띄워 보고(`--version`), 뜨지 않으면 예전 판으로 계속합니다. 깔린 커밋은 `~/.pes/bridge/.rev` 에 적고, PES 「PES 브리지 컴퓨터」의 판에 앞 7자가 붙습니다(예: `2026.11.26-update+c00af43`). 끄려면 환경변수 `PES_BRIDGE_NO_UPDATE=1`. 설치 스크립트가 하는 일(자동 실행 등록 · Node.js 같은 실행 환경)이 바뀐 판은 스스로 못 바꾸니 설치 명령을 다시 실행해 주세요. 이 기능이 없는 예전 판(2026.11.26-device 까지)은 설치 명령을 한 번 다시 실행해야 그 뒤부터 스스로 업데이트합니다.
 
 로그에 「PES 알림에 붙었어요」가 보이면 연결된 것입니다. 「키가 없어요: …」가 보이면 그 키를 넣어 주세요. 지우기는 worker 와 자동 실행만 지웁니다(조사 도구 · API 키 · Node.js · Claude Code 는 그대로, 연결 토큰까지 지우려면 `PES_BRIDGE_PURGE=1`).
 
