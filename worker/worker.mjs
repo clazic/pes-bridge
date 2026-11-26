@@ -900,7 +900,7 @@ async function applyUpdate(rev) {
     const x = await exec('tar', ['-xzf', tgz, '-C', src, '--strip-components', '1'], 60_000)
     if (x.code !== 0) throw new Error(`풀기 실패: ${x.err.trim().split('\n')[0]}`)
     const nw = join(src, 'worker', 'worker.mjs')
-    if (!existsSync(nw) || !readFileSync(nw, 'utf8').includes("'--version'")) throw new Error('받은 판에 worker.mjs(--version)가 없어요')
+    if (!existsSync(nw) || !readFileSync(nw, 'utf8').includes("process.argv.includes('--version')")) throw new Error('받은 판은 스스로 업데이트하기 전 판이에요(--version 명령이 없음)') // 없는 판을 띄우면 브리지가 통째로 돈다
     // 새 판을 실제로 띄워 본다 — 문법 · import · 맨 위 코드가 도는지. 판 글자가 나와야 통과
     const t = await new Promise((res) => execFile(process.execPath, [nw, '--version'], { timeout: 30_000, windowsHide: true, env: { ...process.env, PES_BRIDGE_NO_UPDATE: '1' } }, (e, so, se) => res({ ok: !e && /^\d{4}\.\d+\.\d+/.test(String(so).trim()), out: `${so ?? ''}${se ?? ''}`.trim() })))
     if (!t.ok) throw new Error(`새 판이 뜨지 않아요: ${t.out.split('\n').slice(-1)[0] || '출력 없음'}`)
