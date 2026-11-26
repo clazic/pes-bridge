@@ -23,7 +23,7 @@ import { spawn, execFile } from 'node:child_process'
 import { createServer } from 'node:http'
 import { createHash, randomBytes } from 'node:crypto'
 import { mkdirSync, readFileSync, writeFileSync, chmodSync, statSync, existsSync, readdirSync, renameSync, rmSync, realpathSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { homedir, hostname, userInfo, networkInterfaces, platform as osPlatform, arch as osArch, release as osRelease } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Vault, Relay, RELAY_TOOLS, jevAsk } from './relay.mjs'
@@ -52,6 +52,45 @@ const CLAUDE = process.env.CLAUDE_BIN || which('claude') || (WIN ? 'claude.exe' 
 //   Codex · OpenCode 가 없으면 이 컴퓨터의 npm 으로 받는다(macOS · Linux: ~/.pes/runtime, Windows: npm 전역 %APPDATA%\npm). 처음 한 번 로그인은 사람이 한다
 const ENGINE_KO = { 'claude-code': 'Claude Code', codex: 'Codex', opencode: 'OpenCode' }
 const ENGINE_BIN = { 'claude-code': 'claude', codex: 'codex', opencode: 'opencode' }
+const BRIDGE_VERSION = '2026.11.26-device' // 판 — PES 「PES 브리지 컴퓨터」 기록에 보인다
+
+/**
+ * 이 컴퓨터 정보 — 알림에 붙기 전에 PES 에 알린다(POST /mcp/computer). PES 관리자가 컴퓨터마다 쓰게 · 못 쓰게 정한다.
+ *   machine: 하드웨어 UUID(macOS IOPlatformUUID · Windows MachineGuid · Linux machine-id)의 sha256 앞 32자 — UUID 자체는 보내지 않는다
+ *   그 밖: 컴퓨터 이름 · 로그인 사용자명 · MAC 주소(내부용 · 가상 아닌 인터페이스) · OS · 판 · CPU · 브리지 판 · Node 판 · 깔린 AI
+ */
+const run1 = (cmd, args) => new Promise((ok) => execFile(cmd, args, { timeout: 5000, windowsHide: true }, (e, so) => ok(e ? '' : String(so))))
+let DEVICE = null
+async function deviceInfo() {
+  if (DEVICE) return DEVICE
+  const p = osPlatform()
+  let hw = ''
+  if (p === 'darwin') hw = (/"IOPlatformUUID" = "([^"]+)"/.exec(await run1('/usr/sbin/ioreg', ['-rd1', '-c', 'IOPlatformExpertDevice'])) ?? [])[1] ?? ''
+  else if (p === 'win32') hw = (/MachineGuid\s+REG_SZ\s+(\S+)/i.exec(await run1('reg', ['query', 'HKLM\\SOFTWARE\\Microsoft\\Cryptography', '/v', 'MachineGuid'])) ?? [])[1] ?? ''
+  else { for (const f of ['/etc/machine-id', '/var/lib/dbus/machine-id']) { try { hw = readFileSync(f, 'utf8').trim(); if (hw) break } catch {} } }
+  const ifs = networkInterfaces(), macs = []
+  for (const [iface, list] of Object.entries(ifs)) for (const a of list ?? []) if (!a.internal && a.mac && a.mac !== '00:00:00:00:00:00' && !/^(utun|awdl|llw|bridge|vmnet|veth|docker|lo)/.test(iface) && !macs.some((m) => m.mac === a.mac)) macs.push({ iface, mac: a.mac })
+  const primary = (macs.find((m) => /^(en0|eth0|Ethernet|Wi-?Fi)/i.test(m.iface)) ?? macs[0])?.mac ?? ''
+  let osVer = osRelease()
+  if (p === 'darwin') osVer = (await run1('/usr/bin/sw_vers', ['-productVersion'])).trim() || osVer
+  let user = ''; try { user = userInfo().username } catch {}
+  DEVICE = {
+    machine: createHash('sha256').update(`pes-bridge:${hw || `${hostname()}|${primary}`}`).digest('hex').slice(0, 32),
+    hostname: hostname(), os_user: user, macs, primary_mac: primary, platform: p, os_version: osVer, arch: osArch(), bridge_ver: BRIDGE_VERSION, node_ver: process.version,
+    engines: Object.entries(ENGINE_BIN).filter(([, b]) => which(b)).map(([e]) => e),
+  }
+  return DEVICE
+}
+/** 이 컴퓨터로 PES 를 써도 되나 — {allowed, reason}. 서버가 옛 판이라 길이 없으면(404) 그냥 붙는다 */
+async function computerCheck(key, account) {
+  try {
+    const r = await fetch(`${BASE}/mcp/computer`, { method: 'POST', headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' }, body: JSON.stringify({ ...(await deviceInfo()), account }) })
+    if (r.status === 404) return { allowed: true, machine: '' }
+    const j = await r.json().catch(() => ({}))
+    if (r.status === 401) return { allowed: false, reason: 'unauthorized', auth: true }
+    return { allowed: !!j.allowed, reason: j.reason ?? j.error ?? `HTTP ${r.status}`, machine: j.machine ?? (await deviceInfo()).machine }
+  } catch (e) { return { allowed: true, machine: (await deviceInfo()).machine, offline: String(e?.message ?? e) } } // 네트워크 오류면 붙어 보고 거기서 판단
+}
 const ENGINE_PKG = { codex: '@openai/codex', opencode: 'opencode-ai' }
 const ENGINE_LOGIN = { 'claude-code': 'claude (처음 실행 때 로그인)', codex: 'codex login', opencode: 'opencode auth login' }
 const engineOf = (v) => (ENGINE_BIN[v] ? v : 'claude-code')
@@ -721,7 +760,15 @@ class Account {
     if (this.stopped) return
     const key = await this.key()
     if (!key) { this.log(`키를 받지 못했어요 — 이 계정은 다시 붙여야 해요: node worker.mjs --remove ${this.id} 뒤 --add. 10분 뒤 다시 시도해요.`); setTimeout(() => void this.connect(), 10 * 60_000); return }
-    const ws = new WebSocket(`${BASE.replace(/^http/, 'ws')}/mcp/live`, { headers: { authorization: `Bearer ${key}` } })
+    // 이 컴퓨터로 PES 를 써도 되나(PES 관리자 허용 · 요금제) — 안 되면 10분 뒤 다시 묻는다
+    const cc = await computerCheck(key, this.id)
+    if (!cc.allowed && !cc.auth) {
+      if (this.deniedMsg !== cc.reason) this.log(`이 컴퓨터는 지금 PES 를 쓸 수 없어요 — ${cc.reason} (10분마다 다시 확인해요)`)
+      this.deniedMsg = cc.reason
+      setTimeout(() => void this.connect(), 10 * 60_000); return
+    }
+    if (this.deniedMsg) { this.log('이 컴퓨터가 허용됐어요 — 붙어요'); this.deniedMsg = null }
+    const ws = new WebSocket(`${BASE.replace(/^http/, 'ws')}/mcp/live`, { headers: { authorization: `Bearer ${key}`, ...(cc.machine ? { 'x-pes-device-id': cc.machine } : {}), 'x-pes-account': this.id } })
     this.ws = ws
     ws.onopen = () => { this.retry = 0; this.dead = false; this.log('PES 알림에 붙었어요'); this.ping = setInterval(() => { try { ws.send('ping') } catch {} }, 25_000); this.schedule('붙음 · 밀린 일 확인', 500); void this.runChats('붙음 · 밀린 채팅'); void this.runPolish('붙음 · 밀린 다듬기'); void this.sendModels(key); this.modelTick ??= setInterval(() => void this.key().then((k) => { if (k && !this.stopped) { void this.sendModels(k, true); void this.runEnrich('한 시간마다 · 쉴 때') } }), 3600_000); setTimeout(() => void this.runEnrich('붙음 · 쉴 때'), 120_000) }
     ws.onmessage = (e) => {
@@ -739,6 +786,7 @@ class Account {
     ws.onclose = (e) => {
       clearInterval(this.ping)
       if (this.stopped) return
+      if (e.code === 4003) { this.log(`PES 관리자가 이 컴퓨터를 막아 연결이 끊겼어요${e.reason ? ` — ${e.reason}` : ''}. 10분마다 다시 확인해요`); setTimeout(() => void this.connect(), 10 * 60_000); return }
       if (e.code === 1006) { void this.failed(key); return } // 붙지 못함 — 키가 죽었는지부터 본다
       const wait = Math.min(60_000, 1000 * 2 ** this.retry++)
       this.log(`알림 연결 끊김(${e.code}) — ${Math.round(wait / 1000)}초 뒤 다시`); setTimeout(() => void this.connect(), wait)
