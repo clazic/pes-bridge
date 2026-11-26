@@ -68,8 +68,11 @@ async function deviceInfo() {
   if (p === 'darwin') hw = (/"IOPlatformUUID" = "([^"]+)"/.exec(await run1('/usr/sbin/ioreg', ['-rd1', '-c', 'IOPlatformExpertDevice'])) ?? [])[1] ?? ''
   else if (p === 'win32') hw = (/MachineGuid\s+REG_SZ\s+(\S+)/i.exec(await run1('reg', ['query', 'HKLM\\SOFTWARE\\Microsoft\\Cryptography', '/v', 'MachineGuid'])) ?? [])[1] ?? ''
   else { for (const f of ['/etc/machine-id', '/var/lib/dbus/machine-id']) { try { hw = readFileSync(f, 'utf8').trim(); if (hw) break } catch {} } }
-  const ifs = networkInterfaces(), macs = []
-  for (const [iface, list] of Object.entries(ifs)) for (const a of list ?? []) if (!a.internal && a.mac && a.mac !== '00:00:00:00:00:00' && !/^(utun|awdl|llw|bridge|vmnet|veth|docker|lo)/.test(iface) && !macs.some((m) => m.mac === a.mac)) macs.push({ iface, mac: a.mac })
+  const macs = []
+  // macOS 는 Node 에 MAC 을 02:00:00:00:00:00 으로 감춘다 — 하드웨어 포트 목록(networksetup)에서 장치 주소를 읽는다
+  if (p === 'darwin') for (const m of (await run1('/usr/sbin/networksetup', ['-listallhardwareports'])).matchAll(/Device: (\S+)\s*\nEthernet Address: ([0-9a-f:]{17})/gi)) if (!/^0[02]:00:00:00:00:00$/.test(m[2]) && !/^bridge/.test(m[1]) && !macs.some((x) => x.mac === m[2].toLowerCase())) macs.push({ iface: m[1], mac: m[2].toLowerCase() })
+  const ifs = networkInterfaces()
+  for (const [iface, list] of Object.entries(ifs)) for (const a of list ?? []) if (!a.internal && a.mac && !/^0[02]:00:00:00:00:00$/.test(a.mac) && !/^(utun|awdl|llw|bridge|vmnet|veth|docker|lo)/.test(iface) && !macs.some((m) => m.mac === a.mac)) macs.push({ iface, mac: a.mac })
   const primary = (macs.find((m) => /^(en0|eth0|Ethernet|Wi-?Fi)/i.test(m.iface)) ?? macs[0])?.mac ?? ''
   let osVer = osRelease()
   if (p === 'darwin') osVer = (await run1('/usr/bin/sw_vers', ['-productVersion'])).trim() || osVer
