@@ -185,5 +185,5 @@ pes-scripts/                    clazic/pes 의 scripts/ 를 그대로 옮긴 것
 
 한계:
 - Windows 는 OS 샌드박스가 없다. Claude Code 는 Read 권한 규칙만 쓰고, Codex 는 홈 폴더 읽기를 막지 못한다. 셸 규칙과 감지 표시로 보완한다.
-- OpenCode 의 셸 막기는 글 규칙이다. `cat` 이 작업 폴더 밖을 읽는지는 시험하지 않았다. code mode(`execute`) 안의 MCP 호출은 따로 잡히지 않는다(코드 속 네트워크 흔적만 감지한다).
-- Claude `denyRead` · `allowRead` 가 실제로 듣는지는 실제 AI 로 시험해야 한다(승인 필요).
+- OpenCode 는 셸을 모두 끄고(허용한 `cat` 이 작업 폴더 밖을 읽어서), code mode(`execute`)도 끈다. code mode 를 끄면 MCP 도구가 목록에 바로 실린다(실제 시험 2026-11-28).
+- 실제 AI 시험(2026-11-28) 결과는 think-pes 문서 21 의 7절 「실제 시험」에 있다. Codex 의 하위 에이전트 도구는 `--disable multi_agent` 를 넣어도 남는다(같은 제한을 물려받는다 — 감지로 표시한다).

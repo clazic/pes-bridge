@@ -249,7 +249,14 @@ pub fn claude_settings(s: &Spec) -> Value {
             format!("Read(//{a})")
         }
     };
-    let deny: Vec<String> = s.deny_read.iter().map(rule).collect();
+    // 권한 규칙(Read 도구 · cat 같은 읽기 명령)은 하위 폴더 예외를 두지 못한다 — 이번 실행의 원문 폴더를 품은 폴더(받은 원문 상위)는 빼고,
+    // 그쪽은 샌드박스 denyRead + allowRead 와 --restricted(Read 는 작업 폴더 · --add-dir 안만)로 막는다(실제 시험 2026-11-28)
+    let deny: Vec<String> = s
+        .deny_read
+        .iter()
+        .filter(|p| !s.docs.starts_with(p))
+        .map(rule)
+        .collect();
     let mut v = json!({ "permissions": { "deny": deny } });
     if !s.windows {
         let deny_fs: Vec<String> = s.deny_read.iter().map(|p| crate::paths::slash(p)).collect();
@@ -346,6 +353,13 @@ pub fn codex_args(s: &Spec) -> Vec<String> {
         "computer_use",
         "--disable",
         "in_app_browser",
+        // 그림 만들기 · 하위 에이전트 · 목표 기능도 끈다(실제 시험 2026-11-28 에서 도구 목록에 보였다)
+        "--disable",
+        "image_generation",
+        "--disable",
+        "multi_agent",
+        "--disable",
+        "goals",
     ]
     .iter()
     .map(|x| x.to_string())
@@ -418,12 +432,10 @@ pub fn codex_args(s: &Spec) -> Vec<String> {
 
 /// OpenCode 설정(OPENCODE_CONFIG). carry: 내 opencode.json 에서 옮겨 오는 모델 · 제공자
 pub fn opencode_config(s: &Spec, carry: Map<String, Value>) -> Value {
+    // 셸은 모두 끈다 — 실제 시험(2026-11-28)에서 허용한 cat 이 작업 폴더 밖(키 파일)을 읽었다(external_directory 는 셸에 걸리지 않음).
+    // 파일은 read · grep · glob 도구로 읽는다(그쪽은 external_directory 를 따른다)
     let mut bash = Map::new();
     bash.insert("*".to_string(), json!("deny"));
-    for c in SHELL_OK {
-        bash.insert(c.to_string(), json!("allow"));
-        bash.insert(format!("{c} *"), json!("allow"));
-    }
     let mut outside = Map::new();
     outside.insert("*".to_string(), json!("deny"));
     let docs = crate::paths::slash(s.docs);
@@ -447,9 +459,13 @@ pub fn opencode_config(s: &Spec, carry: Map<String, Value>) -> Value {
         }),
     );
     // websearch 는 넣지 않는다(켬). webfetch · 하위 에이전트는 끈다 — 거부하면 도구가 목록에서 빠진다(티켓 21 O)
+    // code mode(execute)도 끈다 — 끄면 MCP 도구가 목록에 바로 실려(pes_local_kosis …) 브리지가 부른 도구를 볼 수 있다(실제 시험 2026-11-28).
+    //   켜 두면 MCP 를 code mode 안에서 불러 감지가 못 본다. code mode 안 fetch 는 webfetch 거부로 막히는 것을 확인했다
+    // 자동화 · 그림 · 영상 만들기 도구도 끈다(라운드에 쓰지 않는다)
     cfg.insert(
         "permission".to_string(),
-        json!({ "edit": "deny", "webfetch": "deny", "task": "deny", "external_directory": Value::Object(outside), "bash": Value::Object(bash) }),
+        json!({ "edit": "deny", "webfetch": "deny", "task": "deny", "execute": "deny", "automation": "deny", "automation_create": "deny", "automation_delete": "deny", "automation_list": "deny", "automation_pause": "deny", "automation_resume": "deny", "generate_image": "deny", "generate_video": "deny",
+                "external_directory": Value::Object(outside), "bash": Value::Object(bash) }),
     );
     Value::Object(cfg)
 }
@@ -605,7 +621,12 @@ mod tests {
         assert_eq!(c.pointer("/permission/task"), Some(&json!("deny")));
         assert_eq!(c.pointer("/permission/websearch"), None, "웹 검색은 켠다");
         assert_eq!(c.pointer("/permission/bash/*"), Some(&json!("deny")));
-        assert_eq!(c.pointer("/permission/bash/jq *"), Some(&json!("allow")));
+        assert_eq!(
+            c.pointer("/permission/bash/jq *"),
+            None,
+            "OpenCode 셸은 모두 끈다"
+        );
+        assert_eq!(c.pointer("/permission/execute"), Some(&json!("deny")));
         assert_eq!(c.pointer("/permission/bash/kosis"), None);
         assert_eq!(
             c.pointer("/mcp/pes_local/url"),
@@ -671,5 +692,61 @@ mod tests {
             r.as_str()
                 .is_some_and(|x| x.starts_with("Read(//h/.config/pes-bridge"))
         }));
+    }
+
+    /// 실제 AI 시험용(손으로만): 브리지가 만드는 인자 · 설정을 파일로 쓴다. 값은 T22_* 환경 변수의 가짜 경로로 만든다.
+    /// cargo test --bin pes-bridge dump_round_args -- --ignored
+    #[test]
+    #[ignore]
+    fn dump_round_args() -> Result<(), Box<dyn std::error::Error>> {
+        let get = |k: &str| std::env::var(k).map(PathBuf::from);
+        let (home, conf, docs_root, docs, work, out) = (
+            get("T22_HOME")?,
+            get("T22_CONF")?,
+            get("T22_DOCS_ROOT")?,
+            get("T22_DOCS")?,
+            get("T22_WORK")?,
+            get("T22_OUT")?,
+        );
+        let local = std::env::var("T22_LOCAL_URL")?;
+        let deny = deny_read_paths(&home, &conf, &docs_root);
+        let s = Spec {
+            base: &local.replace("/mcp", ""),
+            local_url: &local,
+            deny_read: &deny,
+            work: &work,
+            docs: &docs,
+            skills: &[],
+            home: &home,
+            model: Some("sonnet"),
+            effort: None,
+            windows: false,
+        };
+        let mcp = out.join("mcp.json");
+        std::fs::write(
+            &mcp,
+            claude_mcp(&s, "pes_fakekey0000000000000000", "fake-local-token").to_string(),
+        )?;
+        std::fs::write(
+            out.join("claude.json"),
+            serde_json::to_string(&claude_args(&s, &mcp))?,
+        )?;
+        let sc = Spec { model: None, ..s };
+        std::fs::write(
+            out.join("codex.json"),
+            serde_json::to_string(&codex_args(&sc))?,
+        )?;
+        std::fs::write(
+            out.join("opencode-config.json"),
+            opencode_config(&sc, Map::new()).to_string(),
+        )?;
+        std::fs::write(
+            out.join("opencode-env.json"),
+            serde_json::to_string(&opencode_env(
+                &out.join("opencode-config.json"),
+                &out.join("xdg"),
+            ))?,
+        )?;
+        Ok(())
     }
 }
