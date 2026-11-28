@@ -888,6 +888,27 @@ async fn full_round(engine: &str) -> R<()> {
             "예상 밖 요청: {p}"
         );
     }
+    // AI 가 인자에 이 컴퓨터의 키를 넣어도 근거 기록(인자 · 제목 · 주소 · 조건)에는 남지 않는다
+    let kaid = res
+        .get("keyarg_id")
+        .and_then(Value::as_str)
+        .ok_or("keyarg evidence_id")?;
+    let karec = f
+        .evidence
+        .iter()
+        .find(|x| x.get("id").and_then(Value::as_str) == Some(kaid))
+        .ok_or("keyarg 근거 기록")?;
+    let ks = karec.get("rec").map(Value::to_string).unwrap_or_default();
+    assert!(
+        !ks.contains(FAKE_KOSIS_KEY),
+        "근거 기록에 키가 남았어요: {ks}"
+    );
+    assert!(
+        karec
+            .pointer("/rec/title")
+            .and_then(Value::as_str)
+            .is_some_and(|x| x.contains("(지움)"))
+    );
     // 본 범위: 근거와 함께 첫 쪽, 이어 읽을 때마다 evidence-seen
     let pid = res
         .get("page_id")

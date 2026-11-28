@@ -67,6 +67,7 @@ try {
   await rpc(local, 'initialize', { protocolVersion: '2025-06-18', capabilities: {} }, ltoken)
   const tools = (await rpc(local, 'tools/list', {}, ltoken)).tools.map((t) => t.name)
   const badcli = await call(local, 'kosis', { slug, stage, args: ['update'] })
+  const keyarg = await call(local, 'kosis', { slug, stage, args: ['data', '--tbl', 'DT_KEY', '--note', env.FAKE_KOSIS_KEY ?? ''] })
   const badflag = await call(local, 'kosis', { slug, stage, args: ['data', '101', 'DT', '-o', '/tmp/x.csv'] })
   const kosis = await call(local, 'kosis', { slug, stage, args: ['data', '--tbl', 'DT_TEST'] })
   let fetched = await call(local, 'fetch_url', { slug, stage, url: env.FAKE_PAGE_URL })
@@ -96,7 +97,7 @@ try {
   const details = `인구는 51,751,065명이다${kid ? `[^${kid}]` : '[^unverified]'}. 기관 원문을 확인했다${fid ? `[^${fid}]` : '[^unverified]'}.`
   await call(pes, 'merge_items', { slug, stage, items: [{ kind: 'finding', title: '인구 현황', details, sources: [] }] }, token)
   await call(pes, 'submit_round', { slug, stage, summary: '시험 라운드', review: { summary: '끝', questions: [] } }, token)
-  note({ step: 'results', tools, kosis, fetch_pages: pages, fetch_chars: pageText.length, fetch_tail: pageText.slice(-200), fetch_error: fetched.isError ? fetched.text : null, foreign, pdf, doc, ego, ids, noauth, badcli, badflag, page_id, page_total, big: { isError: bigFirst.isError, text: bigFirst.text.slice(0, 600), data: bigFirst.isError ? null : { evidence_id: bigFirst.data?.evidence_id } }, big_tail: bigText.slice(-200) })
+  note({ step: 'results', tools, kosis, fetch_pages: pages, fetch_chars: pageText.length, fetch_tail: pageText.slice(-200), fetch_error: fetched.isError ? fetched.text : null, foreign, pdf, doc, ego, ids, noauth, badcli, badflag, keyarg_id: keyarg.data?.evidence_id ?? null, page_id, page_total, big: { isError: bigFirst.isError, text: bigFirst.text.slice(0, 600), data: bigFirst.isError ? null : { evidence_id: bigFirst.data?.evidence_id } }, big_tail: bigText.slice(-200) })
   if (engine === 'claude-code') out({ type: 'result', subtype: 'success', result: '시험 라운드를 마쳤어요' })
   else if (engine === 'codex') out({ type: 'item.completed', item: { type: 'agent_message', text: '시험 라운드를 마쳤어요' } })
   else out({ type: 'text', part: { text: '시험 라운드를 마쳤어요' } })

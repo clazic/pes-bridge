@@ -440,6 +440,11 @@ async fn run_capped(
     }
 }
 
+/// 기록에 남길 인자 — 이 컴퓨터의 키 값(그대로 · 주소 꼴 · base64 속 값)을 지운 것
+fn shown_args(args: &[String], hide: &[String]) -> Vec<String> {
+    args.iter().map(|a| cli::scrub(a, hide)).collect()
+}
+
 /// LAW_OC(법령 API 값) — 설치 때 ~/.claude/settings.json 의 env 에 넣는다(Node 브리지 loadLawOc 와 같다)
 fn law_oc(home: &Path) -> Option<String> {
     if std::env::var_os("LAW_OC").is_some() {
@@ -837,7 +842,9 @@ impl Local {
         } else {
             "lookup"
         };
-        let cmdline = cli::scrub(&format!("cli:{bin} {}", args.join(" ")), &hide);
+        // 기록 · 제목 · 다시 조회할 조건에는 키를 지운 인자만 쓴다(CLI 에는 받은 그대로 넘긴다)
+        let shown = shown_args(&args, &hide);
+        let cmdline = format!("cli:{bin} {}", shown.join(" "));
         let mime = if out.trim_start().starts_with(['{', '[']) {
             "application/json"
         } else {
@@ -860,10 +867,10 @@ impl Local {
                 body: &err,
             });
         }
-        let argv = json!({ "cli": bin, "args": args });
+        let argv = json!({ "cli": bin, "args": shown });
         let title = format!(
             "{bin} {}",
-            args.join(" ").chars().take(120).collect::<String>()
+            shown.join(" ").chars().take(120).collect::<String>()
         );
         let tname = format!("pc_{tool}");
         let rec = Rec {
@@ -1483,6 +1490,23 @@ mod tests {
         let (t, utf8) = decode(&bytes, "text/html; charset=euc-kr");
         assert_eq!(t, "인구 통계");
         assert!(!utf8, "UTF-8 이 아니면 원본은 바이트로 올린다");
+    }
+
+    #[test]
+    fn recorded_args_have_no_keys() {
+        let hide = cli::scrub_list(&["realkey0123456789".to_string()]);
+        let args = vec![
+            "data".to_string(),
+            "--key=realkey0123456789".to_string(),
+            "x realkey0123456789 y".to_string(),
+        ];
+        let shown = shown_args(&args, &hide);
+        assert!(
+            shown.iter().all(|a| !a.contains("realkey0123456789")),
+            "{shown:?}"
+        );
+        assert_eq!(shown[0], "data");
+        assert_eq!(shown[1], "--key=(지움)");
     }
 
     #[test]
