@@ -1,0 +1,4 @@
+# Rust 작업 공간 — 지금은 브리지(bridge/) 하나. 업데이터(pes-bridge-update)와 서명 확인 공용 라이브러리(update-core)는 티켓 24 에서 더한다.
+[workspace]
+resolver = "3"
+members = ["bridge"]

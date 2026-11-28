@@ -1,0 +1,4 @@
+#!/bin/sh
+# 가짜 ego-browser — nodejs -e <스크립트> 를 받으면 스크립트 안의 주소로 연 척한다(시험용)
+url=$(printf '%s' "$3" | sed -n 's/^const want = "\(.*\)";$/\1/p')
+printf 'PES_EGO_RESULT {"url":"%s","title":"브라우저 화면","html":"<html><body><div id=app>표 화면 값 42</div></body></html>","text":"표 화면 값 42","links":[["다음","%s#2"]]}\n' "$url" "$url"

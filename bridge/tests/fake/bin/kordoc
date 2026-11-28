@@ -1,0 +1,4 @@
+#!/bin/sh
+# 가짜 kordoc — kordoc <입력> -o <출력> ... : 입력 크기를 적은 Markdown 을 만든다(시험용)
+in="$1"; out="$3"
+printf '# 변환한 문서\n\n첨부 문서 본문 %s 바이트\n' "$(wc -c < "$in" | tr -d ' ')" > "$out"

@@ -161,3 +161,13 @@ pes-scripts/                    clazic/pes 의 scripts/ 를 그대로 옮긴 것
 - **ego-browser 를 안 씀** — ego lite 첫 실행 안내를 끝냈는지, 「PES」 프로필이 있는지 확인하고 worker 를 다시 켜세요(켤 때 프로필을 찾습니다).
 
 라이선스: MIT
+
+
+## Rust 브리지(만드는 중, 티켓 22)
+
+`bridge/` 는 Rust 로 새로 쓰는 브리지다. 지금 판은 계정 하나로 라운드 일만 한다. 채팅 · 다듬기 · 여러 계정 · 키 중계 · 설치는 아직 Node 브리지(`worker/`)가 맡는다.
+
+- 실행: `cargo run -p pes-bridge -- [--account a1] [--once]` · `--check`(AI 판 · 조사 도구 확인) · `--version`.
+- 조사는 AI 의 셸이 아니라 브리지의 pes_local MCP 도구로 한다. 원본은 PES 근거 기록으로 올라간다. 올리지 못하면 그 조회는 실패다.
+- 막는 인자는 티켓 21 에서 확정했다. 셸은 네트워크 없이 jq · grep · cat 만 쓴다. 내장 웹 가져오기는 끄고 웹 검색은 켠다.
+- 서버에 필요한 길은 `bridge/PES-API.md` 에 있다. 지금 PES 서버에는 그 길이 아직 없다.

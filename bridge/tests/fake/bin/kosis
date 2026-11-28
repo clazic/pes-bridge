@@ -1,0 +1,3 @@
+#!/bin/sh
+# 가짜 kosis CLI — 받은 인자를 담아 정해진 JSON 을 돌려준다(시험용)
+printf '{"tbl":"DT_TEST","args":"%s","rows":[{"year":2024,"value":51751065}]}\n' "$*"
