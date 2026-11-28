@@ -188,8 +188,10 @@ pub async fn support(engine: Engine, bin: &Path) -> Support {
 /// 라운드 하나를 띄우는 데 필요한 것
 pub struct Spec<'a> {
     pub base: &'a str,
-    /// pes_local MCP 주소(이 실행만의 토큰이 들어 있다)
+    /// pes_local MCP 주소(토큰 없음 — 토큰은 머리글로: Claude 는 0600 설정 파일, Codex · OpenCode 는 환경 변수 PES_LOCAL_TOKEN)
     pub local_url: &'a str,
+    /// AI 가 셸로 읽지 못하게 할 곳(브리지 설정 · 계정 토큰 · 조사 도구 키 · AI 로그인 정보 등)
+    pub deny_read: &'a [PathBuf],
     pub work: &'a Path,
     pub docs: &'a Path,
     pub skills: &'a [PathBuf],
@@ -199,17 +201,70 @@ pub struct Spec<'a> {
     pub windows: bool,
 }
 
-/// Claude Code 의 MCP 설정(계정 폴더 mcp.json, 0600) — PES 는 머리글에 키, pes_local 은 주소에 실행 토큰
-pub fn claude_mcp(s: &Spec, key: &str) -> Value {
+/// AI 에게 읽지 못하게 할 곳 — 브리지 설정 · 계정(토큰 · 기기 키 · MCP 설정), 조사 도구 키, AI · 클라우드 로그인 정보, 다른 실행의 받은 원문
+pub fn deny_read_paths(home: &Path, conf: &Path, docs_root: &Path) -> Vec<PathBuf> {
+    let mut v = vec![conf.to_path_buf(), docs_root.to_path_buf()];
+    for p in [
+        ".kosis",
+        ".sgis",
+        ".vworld",
+        ".claude/settings.json",
+        ".claude.json",
+        ".codex",
+        ".ssh",
+        ".aws",
+        ".gnupg",
+        ".config/opencode",
+        ".local/share/opencode",
+        ".config/gh",
+        ".netrc",
+        ".docker",
+        ".kube",
+        ".npmrc",
+    ] {
+        v.push(home.join(p));
+    }
+    v
+}
+
+/// Claude Code 의 MCP 설정(계정 폴더 mcp.json, 0600) — PES 는 머리글에 키, pes_local 은 머리글에 실행 토큰
+pub fn claude_mcp(s: &Spec, key: &str, local_token: &str) -> Value {
     json!({ "mcpServers": {
         "pes": { "type": "http", "url": format!("{}/mcp", s.base), "headers": { "Authorization": format!("Bearer {key}") } },
-        "pes_local": { "type": "http", "url": s.local_url },
+        "pes_local": { "type": "http", "url": s.local_url, "headers": { "Authorization": format!("Bearer {local_token}") } },
     } })
 }
 
-/// Claude Code 샌드박스 — 셸 명령의 네트워크를 모두 막는다(티켓 21 C2: 바깥 · 127.0.0.1 모두 못 닿음)
-pub fn claude_sandbox() -> Value {
-    json!({ "sandbox": { "enabled": true, "allowUnsandboxedCommands": false, "failIfUnavailable": true, "network": { "allowedDomains": [] } } })
+/// Claude Code 설정(--settings)
+/// - 샌드박스: 셸 명령의 네트워크를 모두 막는다(티켓 21 C2), 샌드박스 밖 실행 · 샌드박스면 자동 허용을 끈다, 읽기 금지(denyRead).
+///   이 실행의 받은 원문 폴더 · 스킬 폴더는 allowRead 로 다시 연다. Windows 는 샌드박스가 없어 넣지 않는다.
+/// - 권한 규칙: Read 도구도 같은 곳을 읽지 못하게(Windows 포함). 경로는 //절대경로(Claude 규칙 꼴).
+pub fn claude_settings(s: &Spec) -> Value {
+    let rule = |p: &PathBuf| {
+        let a = crate::paths::slash(p);
+        let a = a.trim_start_matches('/');
+        if p.is_dir() {
+            format!("Read(//{a}/**)")
+        } else {
+            format!("Read(//{a})")
+        }
+    };
+    let deny: Vec<String> = s.deny_read.iter().map(rule).collect();
+    let mut v = json!({ "permissions": { "deny": deny } });
+    if !s.windows {
+        let deny_fs: Vec<String> = s.deny_read.iter().map(|p| crate::paths::slash(p)).collect();
+        let allow_fs: Vec<String> = std::iter::once(crate::paths::slash(s.docs))
+            .chain(s.skills.iter().map(|d| crate::paths::slash(d)))
+            .collect();
+        if let Some(o) = v.as_object_mut() {
+            o.insert(
+                "sandbox".to_string(),
+                json!({ "enabled": true, "autoAllowBashIfSandboxed": false, "allowUnsandboxedCommands": false, "failIfUnavailable": true,
+                        "network": { "allowedDomains": [] }, "filesystem": { "denyRead": deny_fs, "allowRead": allow_fs } }),
+            );
+        }
+    }
+    v
 }
 
 pub fn claude_args(s: &Spec, mcp_cfg: &Path) -> Vec<String> {
@@ -244,10 +299,8 @@ pub fn claude_args(s: &Spec, mcp_cfg: &Path) -> Vec<String> {
         "none".to_string(),
         "--no-session-persistence".to_string(),
     ]);
-    if !s.windows {
-        a.push("--settings".to_string());
-        a.push(claude_sandbox().to_string());
-    }
+    a.push("--settings".to_string());
+    a.push(claude_settings(s).to_string());
     if let Some(m) = s.model {
         a.extend(["--model".to_string(), m.to_string()]);
     }
@@ -307,8 +360,13 @@ pub fn codex_args(s: &Spec) -> Vec<String> {
         ]);
     }
     if s.windows {
-        // Windows: 권한 프로필이 없다 — workspace-write(네트워크 기본 꺼짐)
-        a.extend(["-s".to_string(), "workspace-write".to_string()]);
+        // Windows: 권한 프로필이 없다 — workspace-write, 네트워크는 분명히 끈다. 홈 읽기는 막지 못한다(한계 — 감지 표시로 보완)
+        a.extend([
+            "-s".to_string(),
+            "workspace-write".to_string(),
+            "-c".to_string(),
+            "sandbox_workspace_write.network_access=false".to_string(),
+        ]);
     } else {
         let mut fs: Vec<(String, &str)> = vec![
             (":root".to_string(), "read"),
@@ -339,13 +397,18 @@ pub fn codex_args(s: &Spec) -> Vec<String> {
         "-c".to_string(),
         "mcp_servers.pes.bearer_token_env_var=\"PES_MCP_TOKEN\"".to_string(),
         "-c".to_string(),
-        "shell_environment_policy.exclude=[\"PES_MCP_TOKEN\"]".to_string(),
+        "shell_environment_policy.exclude=[\"PES_MCP_TOKEN\",\"PES_LOCAL_TOKEN\"]".to_string(),
         "-c".to_string(),
         "mcp_servers.pes.default_tools_approval_mode=\"approve\"".to_string(),
         "-c".to_string(),
         format!("mcp_servers.pes_local.url={}", toml_str(s.local_url)),
         "-c".to_string(),
+        "mcp_servers.pes_local.bearer_token_env_var=\"PES_LOCAL_TOKEN\"".to_string(),
+        "-c".to_string(),
         "mcp_servers.pes_local.default_tools_approval_mode=\"approve\"".to_string(),
+        // 조사 CLI 는 오래 걸릴 수 있다(CLI 한도 600초) — 도구 기다림을 그보다 길게
+        "-c".to_string(),
+        "mcp_servers.pes_local.tool_timeout_sec=900".to_string(),
         "-C".to_string(),
         crate::paths::slash(s.work),
         "-".to_string(),
@@ -380,7 +443,7 @@ pub fn opencode_config(s: &Spec, carry: Map<String, Value>) -> Value {
         "mcp".to_string(),
         json!({
             "pes": { "type": "remote", "url": format!("{}/mcp", s.base), "headers": { "Authorization": "Bearer {env:PES_MCP_TOKEN}" }, "oauth": false, "enabled": true },
-            "pes_local": { "type": "remote", "url": s.local_url, "oauth": false, "enabled": true },
+            "pes_local": { "type": "remote", "url": s.local_url, "headers": { "Authorization": "Bearer {env:PES_LOCAL_TOKEN}" }, "oauth": false, "enabled": true },
         }),
     );
     // websearch 는 넣지 않는다(켬). webfetch · 하위 에이전트는 끈다 — 거부하면 도구가 목록에서 빠진다(티켓 21 O)
@@ -411,6 +474,8 @@ pub fn opencode_env(cfg: &Path, xdg: &Path) -> Vec<(String, String)> {
             "OPENCODE_DISABLE_PROJECT_CONFIG".to_string(),
             "1".to_string(),
         ),
+        // 사용자 ~/.claude 의 스킬 · CLAUDE.md 를 싣지 않게
+        ("OPENCODE_DISABLE_CLAUDE_CODE".to_string(), "1".to_string()),
     ]
 }
 
@@ -418,10 +483,13 @@ pub fn opencode_env(cfg: &Path, xdg: &Path) -> Vec<(String, String)> {
 mod tests {
     use super::*;
 
+    static DENY: &[PathBuf] = &[];
+
     fn spec<'a>(work: &'a Path, docs: &'a Path, home: &'a Path, windows: bool) -> Spec<'a> {
         Spec {
+            deny_read: DENY,
             base: "https://pes.example",
-            local_url: "http://127.0.0.1:5/mcp/tok",
+            local_url: "http://127.0.0.1:5/mcp",
             work,
             docs,
             skills: &[],
@@ -479,9 +547,24 @@ mod tests {
             v.pointer("/sandbox/allowUnsandboxedCommands"),
             Some(&json!(false))
         );
-        // Windows: 샌드박스 없음(글 규칙 + 감지)
+        assert_eq!(
+            v.pointer("/sandbox/autoAllowBashIfSandboxed"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            v.pointer("/sandbox/filesystem/allowRead/0"),
+            Some(&json!("/d"))
+        );
+        // Windows: 샌드박스 없음(Read 권한 규칙 + 글 규칙 + 감지)
         let wa = claude_args(&spec(w, d, h, true), Path::new("/a/mcp.json"));
-        assert!(!wa.contains(&"--settings".to_string()));
+        let ws = wa
+            .iter()
+            .position(|x| x == "--settings")
+            .and_then(|i| wa.get(i + 1))
+            .map(String::as_str)
+            .unwrap_or("");
+        let wv: Value = serde_json::from_str(ws).unwrap_or(Value::Null);
+        assert!(wv.get("sandbox").is_none() && wv.get("permissions").is_some());
     }
 
     #[test]
@@ -501,7 +584,13 @@ mod tests {
             assert!(a.contains(f), "{f}");
         }
         assert!(a.contains("\"/h\"=\"deny\""), "홈 폴더는 못 읽는다");
-        assert!(a.contains("mcp_servers.pes_local.url=\"http://127.0.0.1:5/mcp/tok\""));
+        assert!(a.contains("mcp_servers.pes_local.url=\"http://127.0.0.1:5/mcp\""));
+        assert!(a.contains("mcp_servers.pes_local.bearer_token_env_var=\"PES_LOCAL_TOKEN\""));
+        assert!(a.contains("mcp_servers.pes_local.tool_timeout_sec=900"));
+        assert!(
+            a.contains("\"PES_LOCAL_TOKEN\"]"),
+            "실행 토큰은 셸 환경에서 뺀다"
+        );
         assert!(a.ends_with("-C /w -"));
         assert!(!a.contains("network={enabled=true}"));
     }
@@ -520,7 +609,11 @@ mod tests {
         assert_eq!(c.pointer("/permission/bash/kosis"), None);
         assert_eq!(
             c.pointer("/mcp/pes_local/url"),
-            Some(&json!("http://127.0.0.1:5/mcp/tok"))
+            Some(&json!("http://127.0.0.1:5/mcp"))
+        );
+        assert_eq!(
+            c.pointer("/mcp/pes_local/headers/Authorization"),
+            Some(&json!("Bearer {env:PES_LOCAL_TOKEN}"))
         );
         assert_eq!(c.get("model"), Some(&json!("p/m")));
         let env = opencode_env(Path::new("/c.json"), Path::new("/x"));
@@ -528,5 +621,55 @@ mod tests {
             "OPENCODE_DISABLE_PROJECT_CONFIG".to_string(),
             "1".to_string()
         )));
+    }
+
+    #[test]
+    fn opencode_env_blocks_project_and_claude_config() {
+        let env = opencode_env(Path::new("/c.json"), Path::new("/x"));
+        for k in [
+            "OPENCODE_DISABLE_PROJECT_CONFIG",
+            "OPENCODE_DISABLE_CLAUDE_CODE",
+        ] {
+            assert!(env.contains(&(k.to_string(), "1".to_string())), "{k}");
+        }
+    }
+
+    #[test]
+    fn claude_read_rules_cover_secrets() {
+        let deny = deny_read_paths(
+            Path::new("/h"),
+            Path::new("/h/.config/pes-bridge"),
+            Path::new("/h/.pes/docs"),
+        );
+        let (w, d, h) = (
+            Path::new("/w"),
+            Path::new("/h/.pes/docs/a1/r1"),
+            Path::new("/h"),
+        );
+        let s = Spec {
+            deny_read: &deny,
+            ..spec(w, d, h, false)
+        };
+        let v = claude_settings(&s);
+        let fs = v
+            .pointer("/sandbox/filesystem/denyRead")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        assert_eq!(fs, deny.len());
+        let empty = Vec::new();
+        let rules = v
+            .pointer("/permissions/deny")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty);
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.as_str().is_some_and(|x| x.starts_with("Read(//h/.kosis")))
+        );
+        assert!(rules.iter().any(|r| {
+            r.as_str()
+                .is_some_and(|x| x.starts_with("Read(//h/.config/pes-bridge"))
+        }));
     }
 }

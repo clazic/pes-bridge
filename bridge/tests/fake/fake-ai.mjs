@@ -21,18 +21,20 @@ const prompt = readFileSync(0, 'utf8')
 const val = (flag) => { const i = argv.indexOf(flag); return i >= 0 ? argv[i + 1] : undefined }
 const cs = argv.flatMap((a, i) => (a === '-c' ? [argv[i + 1]] : []))
 const cval = (k) => { const x = cs.find((c) => c.startsWith(k + '=')); return x ? JSON.parse(x.slice(k.length + 1)) : undefined }
-let pes, token, local, ocfg = null
+let pes, token, local, ltoken, ocfg = null
+const envsub = (s) => String(s ?? '').replace(/\{env:([A-Z_]+)\}/g, (_, k) => env[k] ?? '')
 if (engine === 'claude-code') {
   const cfg = JSON.parse(readFileSync(val('--mcp-config'), 'utf8')).mcpServers
-  pes = cfg.pes.url; token = cfg.pes.headers.Authorization.replace(/^Bearer /, ''); local = cfg.pes_local.url
+  pes = cfg.pes.url; token = cfg.pes.headers.Authorization.replace(/^Bearer /, ''); local = cfg.pes_local.url; ltoken = cfg.pes_local.headers.Authorization.replace(/^Bearer /, '')
 } else if (engine === 'codex') {
-  pes = cval('mcp_servers.pes.url'); token = env.PES_MCP_TOKEN; local = cval('mcp_servers.pes_local.url')
+  pes = cval('mcp_servers.pes.url'); token = env.PES_MCP_TOKEN; local = cval('mcp_servers.pes_local.url'); ltoken = env[cval('mcp_servers.pes_local.bearer_token_env_var')]
 } else {
   ocfg = JSON.parse(readFileSync(env.OPENCODE_CONFIG, 'utf8'))
-  pes = ocfg.mcp.pes.url; token = env.PES_MCP_TOKEN; local = ocfg.mcp.pes_local.url
+  pes = ocfg.mcp.pes.url; token = env.PES_MCP_TOKEN; local = ocfg.mcp.pes_local.url; ltoken = envsub(ocfg.mcp.pes_local.headers.Authorization).replace(/^Bearer /, '')
 }
 note({ step: 'run', engine, argv, cwd: process.cwd(), prompt_has_pes_local: prompt.includes('pes_local'), opencode_config: ocfg,
-  env: { OPENCODE_DISABLE_PROJECT_CONFIG: env.OPENCODE_DISABLE_PROJECT_CONFIG ?? null, LAW_OC: env.LAW_OC ?? null, KOSIS_API_KEY: env.KOSIS_API_KEY ?? null, PES_MCP_TOKEN: !!env.PES_MCP_TOKEN } })
+  local_url: local, local_token_on_cmdline: argv.some((a) => ltoken && a.includes(ltoken)),
+  env: { OPENCODE_DISABLE_PROJECT_CONFIG: env.OPENCODE_DISABLE_PROJECT_CONFIG ?? null, OPENCODE_DISABLE_CLAUDE_CODE: env.OPENCODE_DISABLE_CLAUDE_CODE ?? null, LAW_OC: env.LAW_OC ?? null, KOSIS_API_KEY: env.KOSIS_API_KEY ?? null, PES_MCP_TOKEN: !!env.PES_MCP_TOKEN } })
 
 const out = (o) => process.stdout.write(JSON.stringify(o) + '\n')
 const toolEvent = (name, command) => {
@@ -49,7 +51,7 @@ async function rpc(url, method, params, auth) {
 }
 const call = async (url, name, args, auth) => {
   toolEvent(`mcp__${url === local ? 'pes_local' : 'pes'}__${name}`)
-  const r = await rpc(url, 'tools/call', { name, arguments: args }, auth)
+  const r = await rpc(url, 'tools/call', { name, arguments: args }, auth ?? (url === local ? ltoken : undefined))
   const text = r.content?.[0]?.text ?? ''
   return { isError: !!r.isError, text, data: r.structuredContent ?? (() => { try { return JSON.parse(text) } catch { return null } })() }
 }
@@ -61,8 +63,11 @@ try {
   const it = work.new[0]
   const { slug, stage } = it
   await call(pes, 'start_round', { slug, stage }, token)
-  await rpc(local, 'initialize', { protocolVersion: '2025-06-18', capabilities: {} })
-  const tools = (await rpc(local, 'tools/list', {})).tools.map((t) => t.name)
+  const noauth = await fetch(local, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 0, method: 'tools/list' }) }).then((r) => r.status)
+  await rpc(local, 'initialize', { protocolVersion: '2025-06-18', capabilities: {} }, ltoken)
+  const tools = (await rpc(local, 'tools/list', {}, ltoken)).tools.map((t) => t.name)
+  const badcli = await call(local, 'kosis', { slug, stage, args: ['update'] })
+  const badflag = await call(local, 'kosis', { slug, stage, args: ['data', '101', 'DT', '-o', '/tmp/x.csv'] })
   const kosis = await call(local, 'kosis', { slug, stage, args: ['data', '--tbl', 'DT_TEST'] })
   let fetched = await call(local, 'fetch_url', { slug, stage, url: env.FAKE_PAGE_URL })
   let pageText = fetched.data?.text ?? '', pages = 1
@@ -83,7 +88,7 @@ try {
   const details = `인구는 51,751,065명이다${kid ? `[^${kid}]` : '[^unverified]'}. 기관 원문을 확인했다${fid ? `[^${fid}]` : '[^unverified]'}.`
   await call(pes, 'merge_items', { slug, stage, items: [{ kind: 'finding', title: '인구 현황', details, sources: [] }] }, token)
   await call(pes, 'submit_round', { slug, stage, summary: '시험 라운드', review: { summary: '끝', questions: [] } }, token)
-  note({ step: 'results', tools, kosis, fetch_pages: pages, fetch_chars: pageText.length, fetch_tail: pageText.slice(-200), fetch_error: fetched.isError ? fetched.text : null, foreign, pdf, doc, ego, ids })
+  note({ step: 'results', tools, kosis, fetch_pages: pages, fetch_chars: pageText.length, fetch_tail: pageText.slice(-200), fetch_error: fetched.isError ? fetched.text : null, foreign, pdf, doc, ego, ids, noauth, badcli, badflag })
   if (engine === 'claude-code') out({ type: 'result', subtype: 'success', result: '시험 라운드를 마쳤어요' })
   else if (engine === 'codex') out({ type: 'item.completed', item: { type: 'agent_message', text: '시험 라운드를 마쳤어요' } })
   else out({ type: 'text', part: { text: '시험 라운드를 마쳤어요' } })

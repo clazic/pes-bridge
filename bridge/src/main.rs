@@ -4,15 +4,18 @@
 //!
 //! 실행: pes-bridge [--account aN] [--once]   · pes-bridge --version · pes-bridge --check
 mod account;
+mod cli;
 mod device;
 mod engine;
 mod events;
+mod guard;
 mod html;
 mod live;
 mod local;
 mod log;
 mod paths;
 mod pes;
+mod proc;
 mod prompt;
 mod round;
 mod runner;
@@ -94,9 +97,13 @@ async fn real_main() -> Result<ExitCode> {
     let pes = Arc::new(pes::Pes::new(base, acc)?);
     // clone: Arc — pes_local 서버와 라운드가 같은 PES 연결을 함께 쓴다
     // clone: 경로 — pes_local 서버는 따로 도는 작업이라 자기 몫의 경로를 갖는다(Paths 는 라운드가 쓴다)
-    let local = local::Local::start(Arc::clone(&pes), paths.docs.clone(), paths.home.clone())
-        .await
-        .context("pes_local 서버를 열지 못했어요")?;
+    let local = local::Local::start(
+        Arc::clone(&pes),
+        paths.docs.join(&pes.account.id),
+        paths.home.clone(),
+    )
+    .await
+    .context("pes_local 서버를 열지 못했어요")?;
     let machine = device::machine_id(&paths.conf).await;
     let engines: Vec<&str> = [
         engine::Engine::Claude,
@@ -116,17 +123,8 @@ async fn real_main() -> Result<ExitCode> {
         limits: runner::Limits::from_env(),
     };
 
-    if flag("--once") {
-        // 알림 없이 한 번만 밀린 일을 보고 끝낸다(시험 · 손으로 돌릴 때)
-        return Ok(match round::handle(&b, "한 번 확인").await {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                line(&format!("오류 — {e:#}"));
-                ExitCode::from(1)
-            }
-        });
-    }
-    // 이 컴퓨터로 PES 를 써도 되나 — 안 되면 10분마다 다시 묻는다
+    // 이 컴퓨터로 PES 를 써도 되나 — --once 도 이 확인을 거친다. 안 되면 10분마다 다시 묻는다(--once 는 끝낸다)
+    let once = flag("--once");
     loop {
         match b.pes.computer(&info).await {
             Ok((true, _, _)) => break,
@@ -135,7 +133,20 @@ async fn real_main() -> Result<ExitCode> {
             )),
             Err(e) => line(&format!("컴퓨터 확인 오류 — {e:#} (10분 뒤 다시)")),
         }
+        if once {
+            return Ok(ExitCode::from(2));
+        }
         tokio::time::sleep(Duration::from_secs(600)).await;
+    }
+    if once {
+        // 알림 없이 한 번만 밀린 일을 보고 끝낸다(시험 · 손으로 돌릴 때)
+        return Ok(match round::handle(&b, "한 번 확인").await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                line(&format!("오류 — {e:#}"));
+                ExitCode::from(1)
+            }
+        });
     }
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
     // clone: Arc — 알림 작업과 라운드 작업이 같은 PES 연결을 함께 쓴다

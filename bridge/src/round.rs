@@ -1,10 +1,10 @@
 //! 라운드 한 바퀴 — pending_work 로 일을 보고, 맡을 AI 별로 묶어, 판을 확인한 뒤 막는 인자로 띄우고, 끝나면 알린다.
 use crate::engine::{self, Engine, Spec};
-use crate::local::Local;
+use crate::local::{Local, Opened, Run};
 use crate::log::{Event, line};
 use crate::paths::{Paths, write_private};
 use crate::pes::Pes;
-use crate::runner::{self, Job, Limits};
+use crate::runner::{self, Job, Limits, Outcome};
 use anyhow::{Context, Result};
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
@@ -107,36 +107,93 @@ fn slugs_of(items: &[Value]) -> Vec<String> {
     v
 }
 
-/// 밀린 일을 보고 라운드를 돌린다
-pub async fn handle(b: &Bridge, why: &str) -> Result<()> {
-    let mut out = b.pes.tool("pending_work", json!({})).await?;
-    let n: usize = KINDS
+/// pending_work 의 라운드 일 지문 — 단계별 모델에서 진척이 있었는지 본다(Node 브리지 sig 와 같다)
+fn sig(out: &Value) -> String {
+    let mut v: Vec<String> = KINDS
         .iter()
-        .map(|k| out.get(*k).and_then(Value::as_array).map_or(0, Vec::len))
-        .sum();
-    if n == 0 {
-        line(&format!("[{}] ({why}) 라운드 일 없음", b.pes.account.id));
-        return Ok(());
-    }
-    let def = b
-        .pes
-        .me()
-        .await
-        .ok()
-        .and_then(|m| {
-            m.get("engine")
-                .and_then(Value::as_str)
-                .and_then(Engine::parse)
+        .flat_map(|k| {
+            out.get(*k)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(move |x| {
+                    let s = |f: &str| {
+                        x.get(f)
+                            .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string))
+                            .unwrap_or_default()
+                    };
+                    format!("{k}:{}:{}:{}", s("slug"), s("stage"), s("round"))
+                })
         })
-        .unwrap_or(Engine::Claude);
-    for g in group(&mut out, def) {
-        if let Err(e) = run_group(b, &g, why).await {
-            line(&format!(
-                "[{}] {} 라운드 오류 — {e:#}",
-                b.pes.account.id,
-                g.engine.ko()
-            ));
+        .collect();
+    v.sort();
+    v.join("|")
+}
+
+/// 밀린 일을 보고 라운드를 돌린다. 단계별 모델(per_stage)이면 AI 가 단계 끝에서 멈추므로, 남은 일(다음 단계)이 바뀌었을 때만 그 모델로 이어 띄운다
+pub async fn handle(b: &Bridge, why: &str) -> Result<()> {
+    let mut why = why.to_string();
+    for _ in 0..8 {
+        let mut out = b.pes.tool("pending_work", json!({})).await?;
+        let n: usize = KINDS
+            .iter()
+            .map(|k| out.get(*k).and_then(Value::as_array).map_or(0, Vec::len))
+            .sum();
+        if n == 0 {
+            line(&format!("[{}] ({why}) 라운드 일 없음", b.pes.account.id));
+            return Ok(());
         }
+        let before = sig(&out);
+        let per_stage = KINDS.iter().any(|k| {
+            out.get(*k)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .any(|x| x.get("per_stage").and_then(Value::as_bool) == Some(true))
+        });
+        let def = b
+            .pes
+            .me()
+            .await
+            .ok()
+            .and_then(|m| {
+                m.get("engine")
+                    .and_then(Value::as_str)
+                    .and_then(Engine::parse)
+            })
+            .unwrap_or(Engine::Claude);
+        for g in group(&mut out, def) {
+            if let Err(e) = run_group(b, &g, &why).await {
+                line(&format!(
+                    "[{}] {} 라운드 오류 — {e:#}",
+                    b.pes.account.id,
+                    g.engine.ko()
+                ));
+            }
+        }
+        if !per_stage {
+            return Ok(());
+        }
+        let after = sig(&b.pes.tool("pending_work", json!({})).await?);
+        if after.is_empty() {
+            line(&format!(
+                "[{}] 단계별 모델: 남은 라운드 일이 없어요",
+                b.pes.account.id
+            ));
+            return Ok(());
+        }
+        if after == before {
+            line(&format!(
+                "[{}] 단계별 모델: 남은 일이 그대로예요(진척 없음) — 다시 띄우지 않아요",
+                b.pes.account.id
+            ));
+            return Ok(());
+        }
+        line(&format!(
+            "[{}] 단계별 모델: 진척이 있어 남은 일을 이어 띄워요 ({before} → {after})",
+            b.pes.account.id
+        ));
+        why = "단계별 모델 · 다음 단계".to_string();
     }
     Ok(())
 }
@@ -203,7 +260,6 @@ fn default_model(engine: Engine, home: &std::path::Path) -> Option<String> {
 }
 
 async fn run_group(b: &Bridge, g: &Group, why: &str) -> Result<()> {
-    let acc = &b.pes.account.id;
     let slugs = slugs_of(&g.items);
     let Some(bin) = g.engine.bin() else {
         refuse(
@@ -224,13 +280,91 @@ async fn run_group(b: &Bridge, g: &Group, why: &str) -> Result<()> {
         refuse(b, g, &slugs, &sup.why, &sup.version).await;
         return Ok(());
     }
+    // clone: 맡은 프로젝트 목록은 pes_local 실행(도구가 slug 를 검사)과 여기(신호 · 로그) 두 곳이 쓴다
+    let opened = match b.local.open(slugs.clone(), g.engine.id()) {
+        Ok(o) => o,
+        Err(e) => {
+            let why = format!("받은 원문 폴더를 만들지 못해 라운드를 띄우지 못했어요: {e:#}");
+            finish(b, g, &slugs, &sup.version, None, failed_outcome(why)).await;
+            return Ok(());
+        }
+    };
+    let Opened {
+        token,
+        url,
+        docs,
+        id,
+    } = opened;
+    let guard = RunGuard {
+        local: &b.local,
+        token,
+        done: false,
+    };
+    let l = Launch {
+        bin: &bin,
+        version: &sup.version,
+        slugs: &slugs,
+        url: &url,
+        docs: &docs,
+        token: &guard.token,
+        run_id: &id,
+    };
+    let outcome = launch(b, g, why, &l)
+        .await
+        .unwrap_or_else(|e| failed_outcome(format!("라운드를 띄우지 못했어요: {e:#}")));
+    let run = guard.finish();
+    finish(b, g, &slugs, &sup.version, run, outcome).await;
+    Ok(())
+}
+
+/// 실행 토큰 · 받은 원문 폴더를 닫는 가드 — 중간에 오류로 빠져나가도 닫힌다
+struct RunGuard<'a> {
+    local: &'a Local,
+    token: String,
+    done: bool,
+}
+
+impl RunGuard<'_> {
+    fn finish(mut self) -> Option<Arc<Run>> {
+        self.done = true;
+        self.local.close(&self.token)
+    }
+}
+
+impl Drop for RunGuard<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = self.local.close(&self.token);
+        }
+    }
+}
+
+struct Launch<'a> {
+    bin: &'a std::path::Path,
+    version: &'a str,
+    slugs: &'a [String],
+    url: &'a str,
+    docs: &'a std::path::Path,
+    token: &'a str,
+    run_id: &'a str,
+}
+
+fn failed_outcome(why: String) -> Outcome {
+    Outcome {
+        error: Some(why),
+        last: String::new(),
+        outside: Vec::new(),
+        tool_uses: 0,
+    }
+}
+
+async fn launch(b: &Bridge, g: &Group, why: &str, l: &Launch<'_>) -> Result<Outcome> {
+    let acc = &b.pes.account.id;
     let work = b.paths.work.join(acc);
     std::fs::create_dir_all(&work).context("작업 폴더를 만들지 못했어요")?;
-    std::fs::create_dir_all(&b.paths.docs).context("받은 원문 폴더를 만들지 못했어요")?;
     let skills = b.paths.skill_dirs();
+    let deny = engine::deny_read_paths(&b.paths.home, &b.paths.conf, &b.paths.docs);
     let key = b.pes.key().await?;
-    // clone: 맡은 프로젝트 목록은 pes_local 실행(도구가 slug 를 검사)과 여기(신호 · 로그) 두 곳이 쓴다
-    let (token, local_url) = b.local.open(slugs.clone(), g.engine.id());
     let picked = (!g.model.is_empty()).then_some(g.model.as_str());
     let fallback = if picked.is_none() {
         default_model(g.engine, &b.paths.home)
@@ -242,9 +376,10 @@ async fn run_group(b: &Bridge, g: &Group, why: &str) -> Result<()> {
     let windows = cfg!(windows);
     let spec = Spec {
         base: &b.pes.base,
-        local_url: &local_url,
+        local_url: l.url,
+        deny_read: &deny,
         work: &work,
-        docs: &b.paths.docs,
+        docs: l.docs,
         skills: &skills,
         home: &b.paths.home,
         model,
@@ -275,18 +410,25 @@ async fn run_group(b: &Bridge, g: &Group, why: &str) -> Result<()> {
         "{}{}{}",
         crate::prompt::ROUND,
         crate::prompt::skill_rule(&skills),
-        crate::prompt::only(&slugs, stop.as_deref())
+        crate::prompt::only(l.slugs, stop.as_deref())
     );
     let mut env: Vec<(String, String)> = Vec::new();
     let mut variant: Option<String> = None;
     let args = match g.engine {
         Engine::Claude => {
             let cfg = b.pes.account.dir.join("mcp.json");
-            write_private(&cfg, engine::claude_mcp(&spec, &key).to_string().as_bytes())?;
+            write_private(
+                &cfg,
+                engine::claude_mcp(&spec, &key, l.token)
+                    .to_string()
+                    .as_bytes(),
+            )?;
             engine::claude_args(&spec, &cfg)
         }
         Engine::Codex => {
+            // 토큰은 명령줄이 아니라 환경 변수로(셸 환경에서는 뺀다 — shell_environment_policy.exclude)
             env.push(("PES_MCP_TOKEN".to_string(), key));
+            env.push(("PES_LOCAL_TOKEN".to_string(), l.token.to_string()));
             engine::codex_args(&spec)
         }
         Engine::OpenCode => {
@@ -326,6 +468,7 @@ async fn run_group(b: &Bridge, g: &Group, why: &str) -> Result<()> {
             let xdg = b.paths.conf.join("opencode-home");
             std::fs::create_dir_all(&xdg)?;
             env.push(("PES_MCP_TOKEN".to_string(), key));
+            env.push(("PES_LOCAL_TOKEN".to_string(), l.token.to_string()));
             env.extend(engine::opencode_env(&cfg, &xdg));
             variant = match (effort, base_model) {
                 (Some(e), Some(m)) => Some(format!("{m}#{e}")),
@@ -339,21 +482,21 @@ async fn run_group(b: &Bridge, g: &Group, why: &str) -> Result<()> {
         "{label} ({why}) 할 일 {}건 · {} {} · 모델 {} 시작",
         g.items.len(),
         g.engine.ko(),
-        sup.version,
+        l.version,
         model.unwrap_or("기본")
     ));
-    for s in &slugs {
+    for s in l.slugs {
         log_event(b, &Event {
-            action: "bridge_round_start", project: Some(s), stage: None, target: Some(g.engine.id()), how: format!("{} {} 를 PC 에서 띄움", g.engine.ko(), sup.version),
+            action: "bridge_round_start", project: Some(s), stage: None, target: Some(g.engine.id()), how: format!("{} {} 를 PC 에서 띄움", g.engine.ko(), l.version),
             why_kind: "rule", why: format!("PES 알림({why}) 뒤 pending_work 에 일이 있음"), result: "ok",
-            detail: json!({ "engine": g.engine.id(), "version": sup.version, "model": model, "run": token.chars().take(6).collect::<String>(),
-                            "blocked": { "web_fetch": true, "shell_network": !windows, "shell_rule": "jq · grep · cat 만", "web_search": "켬(단서용)", "research": "pes_local 도구로만" } }),
+            detail: json!({ "engine": g.engine.id(), "version": l.version, "model": model, "run": l.run_id,
+                            "blocked": { "web_fetch": true, "shell_network": !windows, "shell_rule": "jq · grep · cat 만", "read_deny": deny.len(), "web_search": "켬(단서용)", "research": "pes_local 도구로만" } }),
         }).await;
     }
     let remove: Vec<&str> = LOCAL_KEY_ENV.to_vec();
     let job = Job {
         engine: g.engine,
-        bin: &bin,
+        bin: l.bin,
         args: &args,
         env: &env,
         remove: &remove,
@@ -362,7 +505,7 @@ async fn run_group(b: &Bridge, g: &Group, why: &str) -> Result<()> {
         label: &label,
     };
     // clone: Arc — 신호를 보내는 작업들이 같은 PES 연결을 함께 쓴다
-    let mut outcome = runner::run(&job, Arc::clone(&b.pes), &slugs, &b.limits).await;
+    let mut outcome = runner::run(&job, Arc::clone(&b.pes), l.slugs, &b.limits).await;
     if g.engine == Engine::OpenCode
         && variant.is_some()
         && outcome
@@ -379,9 +522,21 @@ async fn run_group(b: &Bridge, g: &Group, why: &str) -> Result<()> {
             args: &args2,
             ..job
         };
-        outcome = runner::run(&job2, Arc::clone(&b.pes), &slugs, &b.limits).await;
+        outcome = runner::run(&job2, Arc::clone(&b.pes), l.slugs, &b.limits).await;
     }
-    let run = b.local.close(&token);
+    Ok(outcome)
+}
+
+/// 라운드 끝 — 실패해도 늘 끝 신호와 작업 로그를 보낸다
+async fn finish(
+    b: &Bridge,
+    g: &Group,
+    slugs: &[String],
+    version: &str,
+    run: Option<Arc<Run>>,
+    outcome: Outcome,
+) {
+    let label = format!("[{}] {}", b.pes.account.id, g.engine.ko());
     let (recorded, failed, calls) = run.as_ref().map_or((Vec::new(), 0, 0), |r| {
         let mut st = r
             .stats
@@ -408,15 +563,14 @@ async fn run_group(b: &Bridge, g: &Group, why: &str) -> Result<()> {
             .map(|e| format!(" — {e}"))
             .unwrap_or_default()
     ));
-    for s in &slugs {
+    for s in slugs {
         log_event(b, &Event {
-            action: "bridge_round_end", project: Some(s), stage: None, target: Some(g.engine.id()), how: format!("{} {}", g.engine.ko(), sup.version),
+            action: "bridge_round_end", project: Some(s), stage: None, target: Some(g.engine.id()), how: format!("{} {version}", g.engine.ko()),
             why_kind: "rule", why: "라운드가 끝나면 결과 · 근거 기록 · PES 밖 조사 흔적을 남긴다".to_string(), result: if outcome.error.is_some() { "fail" } else { "ok" },
             detail: json!({ "error": outcome.error, "evidence": recorded, "evidence_failed": failed, "local_calls": calls, "tool_uses": outcome.tool_uses,
                             "outside_research": { "found": !outcome.outside.is_empty(), "items": outcome.outside } }),
         }).await;
     }
-    Ok(())
 }
 
 #[cfg(test)]

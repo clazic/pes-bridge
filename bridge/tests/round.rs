@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 type R<T> = Result<T, Box<dyn std::error::Error>>;
 const KEY: &str = "pes_testkey0123456789abcdefgh";
 const SLUG: &str = "t22-proj";
+/// 이 컴퓨터 kosis 설정에 넣어 둔 가짜 키 — 가짜 kosis 가 일부러 출력에 섞는다(브리지가 지워야 한다)
+const FAKE_KOSIS_KEY: &str = "fakekosiskey0123456789";
 
 #[derive(Default)]
 struct Fake {
@@ -303,6 +305,11 @@ async fn fake_pes(engine: &str, evidence_fail: bool) -> R<Env> {
     let acc = home.path().join(".config/pes-bridge/accounts/a1");
     std::fs::create_dir_all(&acc)?;
     std::fs::write(acc.join("key"), KEY)?;
+    std::fs::create_dir_all(home.path().join(".kosis"))?;
+    std::fs::write(
+        home.path().join(".kosis/config.yaml"),
+        format!("api_keys:\n    - {FAKE_KOSIS_KEY}\ncache_ttl_hours: 24\n"),
+    )?;
     let log = home.path().join("fake-ai.jsonl");
     Ok(Env {
         st,
@@ -325,7 +332,12 @@ fn exec_bits(p: &Path) -> R<()> {
     Ok(())
 }
 
-fn spawn_bridge(e: &Env, engine: &str, old: bool) -> R<tokio::process::Child> {
+fn spawn_bridge(
+    e: &Env,
+    engine: &str,
+    old: bool,
+    no_pes_profile: bool,
+) -> R<tokio::process::Child> {
     let fake = fake_dir();
     let ai = fake.join("fake-ai.mjs");
     let bin = fake.join("bin");
@@ -357,6 +369,8 @@ fn spawn_bridge(e: &Env, engine: &str, old: bool) -> R<tokio::process::Child> {
         .env("FAKE_PAGE_URL", format!("{}/page.html", e.base))
         .env("PES_BRIDGE_ALLOW_LOOPBACK_FETCH", "1")
         .env("KOSIS_API_KEY", "local-secret-should-not-reach-ai")
+        .env("FAKE_KOSIS_KEY", FAKE_KOSIS_KEY)
+        .env("FAKE_EGO_NO_PES", if no_pes_profile { "1" } else { "0" })
         .kill_on_drop(true)
         .spawn()?;
     Ok(child)
@@ -395,7 +409,7 @@ fn has_log(f: &Fake, action: &str) -> bool {
 /// 일을 받아 라운드 한 바퀴 — 엔진마다
 async fn full_round(engine: &str) -> R<()> {
     let e = fake_pes(engine, false).await?;
-    let mut child = spawn_bridge(&e, engine, false)?;
+    let mut child = spawn_bridge(&e, engine, false, false)?;
     let ok = wait_for(&e.st, 60, |f| {
         !f.submits.is_empty() && has_log(f, "bridge_round_end")
     })
@@ -429,11 +443,20 @@ async fn full_round(engine: &str) -> R<()> {
                 !joined.contains("Bash(kosis"),
                 "조사 CLI 는 셸로 주지 않아요"
             );
+            assert!(joined.contains("\"autoAllowBashIfSandboxed\":false"));
+            assert!(
+                joined.contains("\"denyRead\":[")
+                    && joined.contains(".kosis")
+                    && joined.contains(".config/pes-bridge"),
+                "키 · 토큰 폴더는 셸로 못 읽게"
+            );
+            assert!(joined.contains("Read(//"), "Read 도구에도 읽기 금지 규칙");
         }
         "codex" => {
             assert!(joined.contains("network={enabled=false}"));
             assert!(joined.contains("web_search=\"cached\""));
             assert!(joined.contains("--disable browser_use"));
+            assert!(joined.contains("mcp_servers.pes_local.tool_timeout_sec=900"));
         }
         _ => {
             assert_eq!(
@@ -448,6 +471,10 @@ async fn full_round(engine: &str) -> R<()> {
                 run.pointer("/opencode_config/permission/bash/*"),
                 Some(&json!("deny"))
             );
+            assert_eq!(
+                run.pointer("/env/OPENCODE_DISABLE_CLAUDE_CODE"),
+                Some(&json!("1"))
+            );
         }
     }
     assert_eq!(
@@ -456,6 +483,44 @@ async fn full_round(engine: &str) -> R<()> {
         "이 컴퓨터의 조사 도구 키는 AI 에 넘기지 않아요"
     );
     assert_eq!(run.get("prompt_has_pes_local"), Some(&json!(true)));
+    assert_eq!(
+        run.get("local_token_on_cmdline"),
+        Some(&json!(false)),
+        "실행 토큰은 명령줄에 넣지 않아요"
+    );
+    assert!(
+        !run.get("local_url")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .is_empty()
+    );
+    assert_eq!(
+        res.get("noauth"),
+        Some(&json!(401)),
+        "토큰 없는 요청은 받지 않아요"
+    );
+    assert_eq!(
+        res.pointer("/badcli/isError"),
+        Some(&json!(true)),
+        "update 같은 하위 명령은 거부"
+    );
+    assert_eq!(
+        res.pointer("/badflag/isError"),
+        Some(&json!(true)),
+        "-o 같은 파일 옵션은 거부"
+    );
+    assert!(
+        res.pointer("/badflag/text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("파일을 읽거나 쓰는 옵션")
+    );
+    assert!(
+        res.get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|t| t.contains(&json!("ego_browser"))),
+        "「PES」 프로필이 있으면 ego_browser 를 준다"
+    );
 
     // pes_local 도구 호출 → 원본이 근거 기록으로 올라감
     let tools = res.get("tools").and_then(Value::as_array).ok_or("tools")?;
@@ -485,6 +550,16 @@ async fn full_round(engine: &str) -> R<()> {
         .pointer("/rec/parts/0/body")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    assert!(
+        !kbody.contains(FAKE_KOSIS_KEY) && kbody.contains("(지움)"),
+        "출력에 섞인 이 컴퓨터의 키는 지워요: {kbody}"
+    );
+    assert!(
+        !res.pointer("/kosis/data/text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains(FAKE_KOSIS_KEY)
+    );
     assert!(
         kbody.contains("51751065") && kbody.contains("data --tbl DT_TEST"),
         "응답 원본이 그대로 남아요"
@@ -664,7 +739,7 @@ async fn round_opencode() -> R<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn evidence_upload_failure_fails_the_tool() -> R<()> {
     let e = fake_pes("claude-code", true).await?;
-    let mut child = spawn_bridge(&e, "claude-code", false)?;
+    let mut child = spawn_bridge(&e, "claude-code", false, true)?;
     let ok = wait_for(&e.st, 60, |f| {
         !f.submits.is_empty() && has_log(f, "bridge_round_end")
     })
@@ -674,6 +749,12 @@ async fn evidence_upload_failure_fails_the_tool() -> R<()> {
     let log = ai_log(&e.log);
     let res = step(&log, "results").ok_or("가짜 AI 결과가 없어요")?;
     assert_eq!(res.pointer("/kosis/isError"), Some(&json!(true)));
+    assert!(
+        res.get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|t| !t.contains(&json!("ego_browser"))),
+        "「PES」 프로필이 없으면 ego_browser 를 끈다"
+    );
     let text = res
         .pointer("/kosis/text")
         .and_then(Value::as_str)
@@ -723,7 +804,7 @@ async fn evidence_upload_failure_fails_the_tool() -> R<()> {
 async fn old_ai_is_refused() -> R<()> {
     for engine in ["claude-code", "codex", "opencode"] {
         let e = fake_pes(engine, false).await?;
-        let mut child = spawn_bridge(&e, engine, true)?;
+        let mut child = spawn_bridge(&e, engine, true, false)?;
         let ok = wait_for(&e.st, 30, |f| has_log(f, "bridge_round_refused")).await;
         let _ = child.kill().await;
         assert!(ok, "{engine}: 거부 로그가 없어요");

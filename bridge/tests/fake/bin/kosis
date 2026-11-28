@@ -1,3 +1,3 @@
 #!/bin/sh
-# 가짜 kosis CLI — 받은 인자를 담아 정해진 JSON 을 돌려준다(시험용)
-printf '{"tbl":"DT_TEST","args":"%s","rows":[{"year":2024,"value":51751065}]}\n' "$*"
+# 가짜 kosis CLI — 받은 인자와 (일부러) 이 컴퓨터의 키를 담아 정해진 JSON 을 돌려준다(시험용 — 브리지가 키를 지우는지 본다)
+printf '{"tbl":"DT_TEST","args":"%s","url":"https://kosis.kr/openapi?apiKey=%s","rows":[{"year":2024,"value":51751065}]}\n' "$*" "$FAKE_KOSIS_KEY"

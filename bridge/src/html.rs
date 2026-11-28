@@ -47,6 +47,19 @@ pub fn decode_entities(s: &str) -> String {
     out
 }
 
+/// 대소문자를 가리지 않고 찾기(글 전체를 소문자로 바꾸지 않는다 — 긴 페이지에서 O(n²) 이 되지 않게). needle 은 ASCII
+fn find_ci(hay: &str, needle: &str) -> Option<usize> {
+    let (h, n) = (hay.as_bytes(), needle.as_bytes());
+    if n.is_empty() || h.len() < n.len() {
+        return None;
+    }
+    (0..=h.len() - n.len()).find(|&i| {
+        h.get(i..i + n.len())
+            .is_some_and(|w| w.eq_ignore_ascii_case(n))
+            && hay.is_char_boundary(i)
+    })
+}
+
 fn attr(tag: &str, name: &str) -> Option<String> {
     let lower = tag.to_ascii_lowercase();
     let mut from = 0;
@@ -105,7 +118,7 @@ pub fn to_text(html: &str, base: Option<&reqwest::Url>) -> String {
             && (name == "script" || name == "style" || name == "noscript" || name == "template")
         {
             let close = format!("</{name}");
-            match rest.to_ascii_lowercase().find(&close) {
+            match find_ci(rest, &close) {
                 Some(j) => rest = rest[j..].split_once('>').map(|x| x.1).unwrap_or(""),
                 None => rest = "",
             }
@@ -177,5 +190,19 @@ mod tests {
             "한글 <b> &zz;"
         );
         Ok(())
+    }
+
+    #[test]
+    fn many_scripts_stay_linear() {
+        let h = "<script>x</script><p>가</p>".repeat(20_000);
+        let t = std::time::Instant::now();
+        let out = to_text(&h, None);
+        assert!(out.contains('가'));
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(3),
+            "{:?}",
+            t.elapsed()
+        );
+        assert_eq!(find_ci("abc</SCRIPT>", "</script"), Some(3));
     }
 }

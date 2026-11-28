@@ -2,15 +2,18 @@
 //! 도구: 조사 CLI(kosis · vworld · sgis · korean_law) · kordoc(받은 문서 변환) · fetch_url(PC 에서 원문 열기) · ego_browser(감싼 브라우저) · read_more(긴 결과 이어 읽기).
 //! 도구마다 요청 · 응답 원본을 PES 근거 기록으로 올리고(POST /mcp/evidence) 받은 번호(evidence_id)를 답에 붙인다.
 //! 올리지 못하면 그 도구 호출은 실패로 돌려준다 — 결과를 AI 에 주지 않는다(근거 기록 저장 실패 = 실패).
-//! 실행(라운드)마다 새 토큰을 주소에 넣는다(open → close). 실행이 끝나면 그 주소는 죽는다.
+//! 실행(라운드)마다 새 토큰(Authorization: Bearer — 명령줄 · 주소에는 넣지 않는다)과 새 받은 원문 폴더(~/.pes/docs/<계정>/<실행>)를 쓴다. 닫으면 둘 다 없앤다.
+use crate::cli;
+use crate::guard::Guard;
 use crate::html;
 use crate::log::{Event, line};
 use crate::paths::{child_path, which};
 use crate::pes::Pes;
+use crate::proc::{kill_tree, own_group};
 use crate::time::now_iso;
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{Path as UrlPath, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
@@ -18,10 +21,10 @@ use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::HashMap;
-use std::net::IpAddr;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -30,25 +33,27 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 pub const RAW_MAX: usize = 25 * 1024 * 1024;
 /// AI 에 한 번에 주는 글자 수 — 넘으면 next_from 으로 이어 읽게 한다(잘라 버리지 않는다)
 pub const PAGE: usize = 40_000;
+/// 이어 읽기용으로 한 실행이 들고 있는 글의 한도 — 넘으면 오래된 것부터 버린다
+const CACHE_MAX: usize = 64 * 1024 * 1024;
 const CLI_SECS: u64 = 600;
 
-/// 조사 CLI — (도구 이름, 실행 파일 이름, 안내)
-const CLIS: [(&str, &str, &str); 4] = [
-    ("kosis", "kosis", "KOSIS 국가통계 CLI"),
+/// 조사 CLI — (도구 이름, 안내)
+const CLIS: [(&str, &str); 4] = [
+    (
+        "kosis",
+        "KOSIS 국가통계 CLI(search · meta · data · list · explain · indicator)",
+    ),
     (
         "vworld",
-        "vworld",
-        "VWorld 공간정보 CLI(주소 · 좌표 · 용도지역 · 공간 데이터)",
+        "VWorld 공간정보 CLI(geocode · geocoder · search · data · ned · wms · wfs · catalog)",
     ),
     (
         "sgis",
-        "sgis",
-        "SGIS 통계지리 CLI(인구 · 가구 · 주택 · 사업체 · 행정경계)",
+        "SGIS 통계지리 CLI(data · boundary · geocode · search · code)",
     ),
     (
         "korean_law",
-        "korean-law",
-        "법령 CLI(법령 · 조문 · 조례 · 행정규칙)",
+        "법령 CLI(query · search_* · get_* · compare_* 등 조회 도구)",
     ),
 ];
 
@@ -70,16 +75,50 @@ struct FileRec {
     url: String,
 }
 
+/// 이어 읽기용 글 — 크기 한도 안에서 오래된 것부터 버린다
+#[derive(Default)]
+struct Cache {
+    items: VecDeque<(String, String)>,
+    bytes: usize,
+}
+
+impl Cache {
+    fn put(&mut self, id: String, text: String) {
+        self.bytes += text.len();
+        self.items.push_back((id, text));
+        while self.bytes > CACHE_MAX && self.items.len() > 1 {
+            if let Some((_, t)) = self.items.pop_front() {
+                self.bytes -= t.len();
+            }
+        }
+    }
+    fn get(&self, id: &str) -> Option<&str> {
+        self.items
+            .iter()
+            .find(|(i, _)| i == id)
+            .map(|(_, t)| t.as_str())
+    }
+}
+
 /// 실행(라운드) 하나
 pub struct Run {
     pub id: String,
     pub slugs: Vec<String>,
     pub engine: &'static str,
+    /// 이 실행의 받은 원문 폴더
+    pub docs: PathBuf,
     pub stats: Mutex<Stats>,
-    /// 근거 번호 → AI 가 읽는 글(이어 읽기용, 이 실행 안에서만)
-    cache: Mutex<HashMap<String, String>>,
+    cache: Mutex<Cache>,
     /// 받은 문서 파일 이름 → 근거 기록(kordoc 은 이것만 바꾼다)
     files: Mutex<HashMap<String, FileRec>>,
+    seq: AtomicU32,
+}
+
+pub struct Opened {
+    pub token: String,
+    pub url: String,
+    pub docs: PathBuf,
+    pub id: String,
 }
 
 #[derive(Serialize)]
@@ -125,15 +164,48 @@ struct Rec<'a> {
     requery: Value,
 }
 
+impl<'a> Rec<'a> {
+    fn fail(
+        ctx: &'a Ctx<'a>,
+        tool: &'a str,
+        args: &'a Value,
+        at: &'a str,
+        why: &'a str,
+        url: &'a str,
+    ) -> Self {
+        Rec {
+            slug: ctx.slug,
+            stage: ctx.stage,
+            tool,
+            kind: "original",
+            args,
+            asked_at: at,
+            status: "fail",
+            error: Some(why),
+            title: url,
+            url,
+            via: "pc",
+            route: "pc",
+            engine: ctx.run.engine,
+            run: &ctx.run.id,
+            parts: vec![],
+            binary: None,
+            requery: json!({ "주소": url }),
+        }
+    }
+}
+
 pub struct Local {
     pub port: u16,
     runs: Mutex<HashMap<String, Arc<Run>>>,
     pes: Arc<Pes>,
-    docs: PathBuf,
+    /// ~/.pes/docs/<계정>
+    docs_root: PathBuf,
     home: PathBuf,
+    guard: Guard,
     web: reqwest::Client,
-    /// 시험용: 127.0.0.1 등 내부 주소도 열게 한다(PES_BRIDGE_ALLOW_LOOPBACK_FETCH=1). 평소에는 막는다(로컬 서비스 · pes_local 자신을 열지 못하게)
-    allow_loopback: bool,
+    /// Ego Lite 의 「PES」 프로필(로그인 없는 전용). 없으면 ego_browser 는 끈다
+    ego_profile: Option<String>,
 }
 
 fn same(a: &str, b: &str) -> bool {
@@ -142,40 +214,6 @@ fn same(a: &str, b: &str) -> bool {
             .zip(b.bytes())
             .fold(0u8, |acc, (x, y)| acc | (x ^ y))
             == 0
-}
-
-fn blocked_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v) => {
-            v.is_loopback()
-                || v.is_private()
-                || v.is_link_local()
-                || v.is_unspecified()
-                || v.is_broadcast()
-                || v.octets()[0] == 100 && (v.octets()[1] & 0xc0) == 64
-        }
-        IpAddr::V6(v) => {
-            v.is_loopback()
-                || v.is_unspecified()
-                || (v.segments()[0] & 0xfe00) == 0xfc00
-                || (v.segments()[0] & 0xffc0) == 0xfe80
-        }
-    }
-}
-
-fn blocked_host(u: &reqwest::Url) -> bool {
-    match u.host() {
-        Some(url::Host::Domain(d)) => {
-            let d = d.to_ascii_lowercase();
-            d == "localhost"
-                || d.ends_with(".localhost")
-                || d.ends_with(".local")
-                || d.ends_with(".internal")
-        }
-        Some(url::Host::Ipv4(v)) => blocked_ip(IpAddr::V4(v)),
-        Some(url::Host::Ipv6(v)) => blocked_ip(IpAddr::V6(v)),
-        None => true,
-    }
 }
 
 fn texty(mime: &str) -> bool {
@@ -226,6 +264,15 @@ fn page(text: &str, from: usize) -> Value {
             "read": if next.is_some() { "아직 끝이 아니에요 — read_more {evidence_id, from: next_from} 로 끝까지 이어 읽으세요" } else { "끝까지 받았어요" } })
 }
 
+fn with<const N: usize>(mut p: Value, kv: [(&str, Value); N]) -> Value {
+    if let Some(o) = p.as_object_mut() {
+        for (k, v) in kv {
+            o.insert(k.to_string(), v);
+        }
+    }
+    p
+}
+
 fn str_arg<'a>(a: &'a Value, k: &str) -> Option<&'a str> {
     a.get(k)
         .and_then(Value::as_str)
@@ -249,20 +296,22 @@ fn safe_name(s: &str) -> String {
     if n.is_empty() { "file".to_string() } else { n }
 }
 
-async fn read_cap<R: AsyncRead + Unpin>(r: Option<R>, cap: usize) -> (Vec<u8>, bool) {
+/// (읽은 것, 한도를 넘었나, 읽기 오류가 났나)
+async fn read_cap<R: AsyncRead + Unpin>(r: Option<R>, cap: usize) -> (Vec<u8>, bool, bool) {
     let Some(mut r) = r else {
-        return (Vec::new(), false);
+        return (Vec::new(), false, true);
     };
     let mut out = Vec::new();
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         match r.read(&mut buf).await {
-            Ok(0) | Err(_) => return (out, false),
+            Ok(0) => return (out, false, false),
+            Err(_) => return (out, false, true),
             Ok(n) => {
                 out.extend_from_slice(buf.get(..n).unwrap_or_default());
                 if out.len() > cap {
                     out.truncate(cap);
-                    return (out, true);
+                    return (out, true, false);
                 }
             }
         }
@@ -276,10 +325,48 @@ struct Capped {
     stderr: Vec<u8>,
     over: bool,
     timed_out: bool,
+    read_err: bool,
     spawn_err: Option<String>,
 }
 
-/// 명령을 셸 없이(인자 배열 그대로) 돌린다 — 출력은 cap 바이트까지, secs 초 안에
+impl Capped {
+    /// 실패 까닭(없으면 None)
+    fn failure(&mut self, bin: &str) -> Option<String> {
+        self.spawn_err
+            .take()
+            .map(|e| format!("{bin} 을 띄우지 못했어요: {e}"))
+            .or_else(|| {
+                self.timed_out
+                    .then(|| format!("{CLI_SECS}초가 넘어 멈췄어요"))
+            })
+            .or_else(|| {
+                self.over
+                    .then(|| format!("원본이 너무 커요(한도 {}MB)", RAW_MAX >> 20))
+            })
+            .or_else(|| {
+                self.read_err
+                    .then(|| format!("{bin} 출력을 끝까지 읽지 못했어요"))
+            })
+            .or_else(|| {
+                (self.code != Some(0)).then(|| {
+                    format!(
+                        "{bin} 이 {} 로 끝났어요",
+                        self.code.map_or("신호".to_string(), |x| x.to_string())
+                    )
+                })
+            })
+    }
+}
+
+fn kill_logged(pid: Option<u32>, what: &str) {
+    if let Some(p) = pid
+        && let Err(e) = kill_tree(p)
+    {
+        line(&format!("{what}: {e}"));
+    }
+}
+
+/// 명령을 셸 없이(인자 배열 그대로) 새 프로세스 묶음으로 돌린다 — 출력은 RAW_MAX 바이트까지, secs 초 안에. 넘으면 묶음째 끝낸다
 async fn run_capped(
     bin: &Path,
     args: &[String],
@@ -295,6 +382,7 @@ async fn run_capped(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    own_group(&mut cmd);
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -307,11 +395,13 @@ async fn run_capped(
             };
         }
     };
+    let pid = child.id();
     let (so, se) = (child.stdout.take(), child.stderr.take());
     let all = async {
-        let ((out, over), (err, _)) = tokio::join!(read_cap(so, RAW_MAX), read_cap(se, 1 << 20));
+        let ((out, over, e1), (err, _, e2)) =
+            tokio::join!(read_cap(so, RAW_MAX), read_cap(se, 1 << 20));
         if over {
-            let _ = child.start_kill();
+            kill_logged(pid, "출력이 너무 큰 명령을 끝내지 못했어요");
         }
         let code = child.wait().await.ok().and_then(|s| s.code());
         Capped {
@@ -319,15 +409,19 @@ async fn run_capped(
             stdout: out,
             stderr: err,
             over,
+            read_err: e1 || e2,
             ..Capped::default()
         }
     };
     match tokio::time::timeout(Duration::from_secs(secs), all).await {
         Ok(c) => c,
-        Err(_) => Capped {
-            timed_out: true,
-            ..Capped::default()
-        },
+        Err(_) => {
+            kill_logged(pid, "멈춘 명령을 끝내지 못했어요");
+            Capped {
+                timed_out: true,
+                ..Capped::default()
+            }
+        }
     }
 }
 
@@ -343,38 +437,73 @@ fn law_oc(home: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Ego Lite 의 「PES」 프로필 id — 없거나 못 읽으면 None(그러면 ego_browser 를 끈다: 로그인한 프로필로 열지 않게)
+async fn ego_profile(docs: &Path) -> Option<String> {
+    let bin = which("ego-browser")?;
+    let script = r#"try { const ps = await profiles(); const p = (ps || []).find((x) => /^pes$/i.test(String(x.name || "").trim())); console.log("PES_EGO_PROFILE " + JSON.stringify(p ? String(p.id) : null)) } catch (e) { console.log("PES_EGO_PROFILE null") }"#;
+    for _ in 0..3 {
+        let c = run_capped(
+            &bin,
+            &["nodejs".to_string(), "-e".to_string(), script.to_string()],
+            docs,
+            &[],
+            30,
+        )
+        .await;
+        let all = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&c.stdout),
+            String::from_utf8_lossy(&c.stderr)
+        );
+        if let Some(j) = all
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("PES_EGO_PROFILE "))
+        {
+            return serde_json::from_str::<Option<String>>(j).ok().flatten();
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+    None
+}
+
 impl Local {
-    pub async fn start(pes: Arc<Pes>, docs: PathBuf, home: PathBuf) -> anyhow::Result<Arc<Self>> {
-        let allow_loopback =
-            std::env::var("PES_BRIDGE_ALLOW_LOOPBACK_FETCH").is_ok_and(|v| v == "1");
-        let web = reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (compatible; pes-bridge)")
-            .timeout(Duration::from_secs(120))
-            .redirect(reqwest::redirect::Policy::custom(move |at| {
-                if at.previous().len() >= 10 {
-                    at.error("주소 넘김이 너무 많아요")
-                } else if !allow_loopback && blocked_host(at.url()) {
-                    at.error("내부 주소로 넘기는 것은 따라가지 않아요")
-                } else {
-                    at.follow()
-                }
-            }))
-            .build()?;
+    pub async fn start(
+        pes: Arc<Pes>,
+        docs_root: PathBuf,
+        home: PathBuf,
+    ) -> anyhow::Result<Arc<Self>> {
+        let off = std::env::var("PES_BRIDGE_ALLOW_LOOPBACK_FETCH").is_ok_and(|v| v == "1");
+        if off {
+            line(
+                "시험 설정: 원문 열기의 내부 주소 막기를 껐어요(PES_BRIDGE_ALLOW_LOOPBACK_FETCH=1)",
+            );
+        }
+        let guard = Guard::new(Arc::new(crate::guard::SystemLookup), Vec::new(), off);
+        let web = guard.client("Mozilla/5.0 (compatible; pes-bridge)")?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
-        std::fs::create_dir_all(&docs)?;
+        std::fs::create_dir_all(&docs_root)?;
+        let ego = ego_profile(&docs_root).await;
+        match (&ego, which("ego-browser")) {
+            (Some(p), _) => line(&format!("ego-browser: 「PES」 프로필({p})로만 열어요")),
+            (None, Some(_)) => line(
+                "ego-browser: 「PES」 프로필이 없어 ego_browser 도구를 끕니다 — 로그인 없는 전용 프로필을 Ego Lite 에서 「PES」 이름으로 만들면 켜져요",
+            ),
+            (None, None) => {}
+        }
         let local = Arc::new(Self {
             port,
             runs: Mutex::new(HashMap::new()),
             pes,
-            docs,
+            docs_root,
             home,
+            guard,
             web,
-            allow_loopback,
+            ego_profile: ego,
         });
         // clone: 서버 작업(axum)과 브리지(실행 열기 · 닫기)가 같은 Local 을 함께 쓴다
         let app = Router::new()
-            .route("/mcp/{token}", any(handle))
+            .route("/mcp", any(handle))
             .with_state(Arc::clone(&local));
         tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, app).await {
@@ -384,26 +513,43 @@ impl Local {
         Ok(local)
     }
 
-    /// 실행 하나를 연다 → (토큰, 주소)
-    pub fn open(&self, slugs: Vec<String>, engine: &'static str) -> (String, String) {
+    /// 실행 하나를 연다 — 토큰 · 주소(토큰 없음) · 받은 원문 폴더
+    pub fn open(&self, slugs: Vec<String>, engine: &'static str) -> anyhow::Result<Opened> {
         let token = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
-        let id = token.chars().take(6).collect::<String>();
+        let id = hex::encode(rand::random::<[u8; 4]>());
+        let docs = self.docs_root.join(&id);
+        std::fs::create_dir_all(&docs)?;
         let run = Run {
             id,
             slugs,
             engine,
+            docs,
             stats: Mutex::new(Stats::default()),
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(Cache::default()),
             files: Mutex::new(HashMap::new()),
+            seq: AtomicU32::new(1),
         };
-        let url = format!("http://127.0.0.1:{}/mcp/{token}", self.port);
-        lock(&self.runs).insert(token.clone(), Arc::new(run)); // clone: 토큰은 표의 열쇠이자 부른 쪽이 닫을 때 쓰는 값이다
-        (token, url)
+        // clone: 이 값들은 표(실행)와 부른 쪽(AI 설정 · 닫기) 두 곳이 쓴다
+        let opened = Opened {
+            token: token.clone(),
+            url: format!("http://127.0.0.1:{}/mcp", self.port),
+            docs: run.docs.clone(),
+            id: run.id.clone(),
+        };
+        lock(&self.runs).insert(token, Arc::new(run));
+        Ok(opened)
     }
 
-    /// 실행을 닫는다 → 그 실행(통계). 그 뒤 주소는 401
+    /// 실행을 닫는다 → 그 실행(통계). 그 뒤 토큰은 401, 받은 원문 폴더는 지운다(원본은 PES 근거 기록에 있다)
     pub fn close(&self, token: &str) -> Option<Arc<Run>> {
-        lock(&self.runs).remove(token)
+        let run = lock(&self.runs).remove(token)?;
+        if let Err(e) = std::fs::remove_dir_all(&run.docs) {
+            line(&format!(
+                "받은 원문 폴더를 지우지 못했어요({}): {e}",
+                run.docs.display()
+            ));
+        }
+        Some(run)
     }
 
     fn find(&self, token: &str) -> Option<Arc<Run>> {
@@ -423,20 +569,23 @@ impl Local {
             p
         };
         let mut v = Vec::new();
-        for (name, bin, about) in CLIS {
+        for (name, about) in CLIS {
+            let Some(bin) = cli::bin_of(name) else {
+                continue;
+            };
             if which(bin).is_some() {
-                v.push(json!({ "name": name, "description": format!("{about}를 이 컴퓨터에서 돌린다(셸 없이). args 에 그 CLI 의 인자를 배열로 준다(예: [\"query\", \"민법 제1조\"]). 요청 · 응답 원본은 PES 근거 기록으로 남고 evidence_id 가 붙어 온다 — 그 결과로 쓴 문장에 [^evidence_id] 를 단다. 결과가 길면 read_more 로 끝까지 읽는다."),
+                v.push(json!({ "name": name, "description": format!("{about}를 이 컴퓨터에서 돌린다(셸 없이). args 의 첫 값은 하위 명령, 그 뒤는 인자(예: [\"query\", \"민법 제1조\"]). 파일을 읽고 쓰는 옵션(-o · --output · --input · --config …)은 쓸 수 없다. 요청 · 응답 원본은 PES 근거 기록으로 남고 evidence_id 가 붙어 온다 — 그 결과로 쓴 문장에 [^evidence_id] 를 단다. 결과가 길면 read_more 로 끝까지 읽는다."),
                     "inputSchema": { "type": "object", "properties": base(json!({ "args": { "type": "array", "items": { "type": "string" }, "description": format!("{bin} CLI 인자") } })), "required": ["slug", "args"] } }));
             }
         }
         if which("kordoc").is_some() {
-            v.push(json!({ "name": "kordoc", "description": "fetch_url · ego_browser 로 받은 문서 파일(HWP · HWPX · PDF · 오피스)을 Markdown 으로 바꿔 읽는다. file 은 그 도구가 돌려준 file 이름. 바꾼 글도 근거 기록으로 남는다.",
+            v.push(json!({ "name": "kordoc", "description": "fetch_url 로 받은 문서 파일(HWP · HWPX · PDF · 오피스)을 Markdown 으로 바꿔 읽는다. file 은 그 도구가 돌려준 file 이름. 바꾼 글도 근거 기록으로 남는다.",
                 "inputSchema": { "type": "object", "properties": base(json!({ "file": { "type": "string" }, "pages": { "type": "string", "description": "쪽 범위(예: 1-20)" }, "ocr": { "type": "boolean" } })), "required": ["slug", "file"] } }));
         }
-        v.push(json!({ "name": "fetch_url", "description": "웹 원문을 이 컴퓨터에서 연다(내장 웹 가져오기 대신). 받은 원본은 PES 근거 기록으로 남고 evidence_id 가 붙어 온다. HTML 은 읽을 글(링크 포함)로, 문서 파일은 file 이름으로 돌려준다(kordoc 으로 읽는다).",
+        v.push(json!({ "name": "fetch_url", "description": "웹 원문을 이 컴퓨터에서 연다(내장 웹 가져오기 대신). 받은 원본은 PES 근거 기록으로 남고 evidence_id 가 붙어 온다. HTML 은 읽을 글(링크 포함)로, 문서 파일은 file 이름으로 돌려준다(kordoc 으로 읽는다). 이 컴퓨터 · 사설망 주소는 열지 않는다.",
             "inputSchema": { "type": "object", "properties": base(json!({ "url": { "type": "string", "description": "http(s) 주소" } })), "required": ["slug", "url"] } }));
-        if which("ego-browser").is_some() {
-            v.push(json!({ "name": "ego_browser", "description": "fetch_url 로 내용이 안 나오는 화면(자바스크립트로 그리는 화면 · 통계 표 · 지도)을 브라우저로 열어 읽는다. 공개 페이지 읽기만 한다. 연 페이지 원본은 PES 근거 기록으로 남는다.",
+        if self.ego_profile.is_some() && which("ego-browser").is_some() {
+            v.push(json!({ "name": "ego_browser", "description": "fetch_url 로 내용이 안 나오는 화면(자바스크립트로 그리는 화면 · 통계 표 · 지도)을 브라우저(로그인 없는 「PES」 프로필)로 열어 읽는다. 공개 페이지 읽기만 한다. 연 페이지 원본은 PES 근거 기록으로 남는다.",
                 "inputSchema": { "type": "object", "properties": base(json!({ "url": { "type": "string" } })), "required": ["slug", "url"] } }));
         }
         v.push(json!({ "name": "read_more", "description": "긴 결과를 이어 읽는다 — 앞 도구가 준 evidence_id 와 next_from.",
@@ -481,7 +630,7 @@ impl Local {
 
     async fn call(&self, run: &Run, name: &str, a: &Value) -> Result<Value, String> {
         if name == "read_more" {
-            return self.read_more(run, a);
+            return Self::read_more(run, a);
         }
         let slug = str_arg(a, "slug").ok_or("slug 가 필요해요.")?;
         if !run.slugs.iter().any(|s| s == slug) {
@@ -492,13 +641,14 @@ impl Local {
         }
         let stage = str_arg(a, "stage");
         let ctx = Ctx { run, slug, stage };
-        if let Some((tool, bin, _)) = CLIS.iter().find(|(n, _, _)| *n == name) {
-            return self.cli(&ctx, tool, bin, a).await;
+        if CLIS.iter().any(|(n, _)| *n == name) {
+            return self.cli(&ctx, name, a).await;
         }
         match name {
             "kordoc" => self.kordoc(&ctx, a).await,
             "fetch_url" => self.fetch(&ctx, a).await,
-            "ego_browser" => self.ego(&ctx, a).await,
+            "ego_browser" if self.ego_profile.is_some() => self.ego(&ctx, a).await,
+            "ego_browser" => Err("ego_browser 를 쓸 수 없어요 — Ego Lite 에 「PES」 프로필(로그인 없는 전용)이 없어요.".to_string()),
             _ => Err(format!("없는 도구예요: {name}")),
         }
     }
@@ -535,11 +685,7 @@ impl Local {
         }
     }
 
-    fn remember(&self, ctx: &Ctx<'_>, id: String, text: String) {
-        lock(&ctx.run.cache).insert(id, text);
-    }
-
-    fn read_more(&self, run: &Run, a: &Value) -> Result<Value, String> {
+    fn read_more(run: &Run, a: &Value) -> Result<Value, String> {
         let id = str_arg(a, "evidence_id").ok_or("evidence_id 가 필요해요.")?;
         let from = a
             .get("from")
@@ -547,17 +693,13 @@ impl Local {
             .and_then(|n| usize::try_from(n).ok())
             .unwrap_or(0);
         let cache = lock(&run.cache);
-        let text = cache
-            .get(id)
-            .ok_or("이번 실행에서 받은 결과가 아니에요(앞 도구가 준 evidence_id 를 쓰세요).")?;
-        let mut p = page(text, from);
-        if let Some(o) = p.as_object_mut() {
-            o.insert("evidence_id".to_string(), json!(id));
-        }
-        Ok(p)
+        let text = cache.get(id).ok_or(
+            "이번 실행에서 받은 결과가 아니거나, 오래돼 지웠어요(같은 도구로 다시 조회하세요).",
+        )?;
+        Ok(with(page(text, from), [("evidence_id", json!(id))]))
     }
 
-    async fn cli(&self, ctx: &Ctx<'_>, tool: &str, bin: &str, a: &Value) -> Result<Value, String> {
+    async fn cli(&self, ctx: &Ctx<'_>, tool: &str, a: &Value) -> Result<Value, String> {
         let args: Vec<String> = a
             .get("args")
             .and_then(Value::as_array)
@@ -571,30 +713,22 @@ impl Local {
         if args.is_empty() || args.len() > 64 || args.iter().any(|x| x.len() > 4000) {
             return Err("args 는 문자열 1~64개(각 4000자 안)여야 해요.".to_string());
         }
+        cli::check_args(tool, &args)?;
+        let bin = cli::bin_of(tool).ok_or("없는 조사 도구예요.")?;
         let path = which(bin).ok_or_else(|| format!("이 컴퓨터에 {bin} 이 없어요."))?;
+        if let Some(why) = cli::missing_key(tool, &self.home) {
+            return Err(why);
+        }
+        let hide = cli::scrub_list(&cli::local_keys(tool, &self.home));
         let envs: Vec<(String, String)> = law_oc(&self.home)
             .map(|v| vec![("LAW_OC".to_string(), v)])
             .unwrap_or_default();
         let at = now_iso();
-        let mut c = run_capped(&path, &args, &self.docs, &envs, CLI_SECS).await;
-        let out = String::from_utf8_lossy(&c.stdout).into_owned();
-        let err = String::from_utf8_lossy(&c.stderr).into_owned();
-        let fail = c
-            .spawn_err
-            .take()
-            .or_else(|| c.timed_out.then(|| format!("{CLI_SECS}초가 넘어 멈췄어요")))
-            .or_else(|| {
-                c.over
-                    .then(|| format!("원본이 너무 커요(한도 {}MB)", RAW_MAX >> 20))
-            })
-            .or_else(|| {
-                (c.code != Some(0)).then(|| {
-                    format!(
-                        "{bin} 이 {} 로 끝났어요",
-                        c.code.map_or("신호".to_string(), |x| x.to_string())
-                    )
-                })
-            });
+        let mut c = run_capped(&path, &args, &ctx.run.docs, &envs, CLI_SECS).await;
+        let fail = c.failure(bin);
+        // 출력에 이 컴퓨터의 키가 섞여 오면 지운다(근거 기록 · AI 답 모두)
+        let out = cli::scrub(&String::from_utf8_lossy(&c.stdout), &hide);
+        let err = cli::scrub(&String::from_utf8_lossy(&c.stderr), &hide);
         let status = if fail.is_some() {
             "fail"
         } else if out.trim().is_empty() {
@@ -603,12 +737,23 @@ impl Local {
             "ok"
         };
         let first = args.first().map(String::as_str).unwrap_or_default();
-        let kind = if ["search", "find", "list", "ls", "catalog"].contains(&first) {
+        let kind = if [
+            "search",
+            "s",
+            "list",
+            "ls",
+            "catalog",
+            "suggest_law_names",
+            "search_all",
+        ]
+        .contains(&first)
+            || first.starts_with("search_")
+        {
             "search"
         } else {
             "lookup"
         };
-        let cmdline = format!("cli:{bin} {}", args.join(" "));
+        let cmdline = cli::scrub(&format!("cli:{bin} {}", args.join(" ")), &hide);
         let mime = if out.trim_start().starts_with(['{', '[']) {
             "application/json"
         } else {
@@ -636,10 +781,11 @@ impl Local {
             "{bin} {}",
             args.join(" ").chars().take(120).collect::<String>()
         );
+        let tname = format!("pc_{tool}");
         let rec = Rec {
             slug: ctx.slug,
             stage: ctx.stage,
-            tool: tool_name(tool),
+            tool: &tname,
             kind,
             args: &argv,
             asked_at: &at,
@@ -662,32 +808,12 @@ impl Local {
                 format!("{err}{out}").chars().take(1500).collect::<String>()
             ));
         }
-        let mut p = page(&out, 0);
-        if let Some(o) = p.as_object_mut() {
-            o.insert("evidence_id".to_string(), json!(id));
-            o.insert("status".to_string(), json!(status));
-        }
-        self.remember(ctx, id, out);
+        let p = with(
+            page(&out, 0),
+            [("evidence_id", json!(id)), ("status", json!(status))],
+        );
+        lock(&ctx.run.cache).put(id, out);
         Ok(p)
-    }
-
-    async fn check_host(&self, u: &reqwest::Url) -> Result<(), String> {
-        if self.allow_loopback {
-            return Ok(());
-        }
-        if blocked_host(u) {
-            return Err("내부 주소(이 컴퓨터 · 사설망)는 열지 않아요.".to_string());
-        }
-        if let Some(url::Host::Domain(d)) = u.host() {
-            let port = u.port_or_known_default().unwrap_or(443);
-            let addrs = tokio::net::lookup_host((d, port))
-                .await
-                .map_err(|e| format!("주소를 찾지 못했어요: {e}"))?;
-            if addrs.into_iter().any(|a| blocked_ip(a.ip())) {
-                return Err("내부 주소(이 컴퓨터 · 사설망)로 가는 이름은 열지 않아요.".to_string());
-            }
-        }
-        Ok(())
     }
 
     async fn fetch(&self, ctx: &Ctx<'_>, a: &Value) -> Result<Value, String> {
@@ -696,33 +822,16 @@ impl Local {
         if !matches!(u.scheme(), "http" | "https") {
             return Err("http(s) 주소만 열어요.".to_string());
         }
-        self.check_host(&u).await?;
+        self.guard.check_url(&u).await?;
         let at = now_iso();
         let argv = json!({ "url": raw });
         let resp = match self.web.get(u.as_str()).send().await {
             Ok(r) => r,
             Err(e) => {
-                let why = format!("열지 못했어요: {e}");
-                let rec = Rec {
-                    slug: ctx.slug,
-                    stage: ctx.stage,
-                    tool: "pc_fetch",
-                    kind: "original",
-                    args: &argv,
-                    asked_at: &at,
-                    status: "fail",
-                    error: Some(&why),
-                    title: raw,
-                    url: raw,
-                    via: "pc",
-                    route: "pc",
-                    engine: ctx.run.engine,
-                    run: &ctx.run.id,
-                    parts: vec![],
-                    binary: None,
-                    requery: json!({ "주소": raw }),
-                };
-                let id = self.record(ctx, &rec).await?;
+                let why = format!("열지 못했어요: {}", error_chain(&e));
+                let id = self
+                    .record(ctx, &Rec::fail(ctx, "pc_fetch", &argv, &at, &why, raw))
+                    .await?;
                 return Err(format!(
                     "{why} (실패도 근거 기록 {id} 로 남았어요 — 인용하지 마세요)"
                 ));
@@ -752,26 +861,12 @@ impl Local {
                 Ok(None) => break,
                 Err(e) => {
                     let why = format!("받는 도중 끊겼어요: {e}");
-                    let rec = Rec {
-                        slug: ctx.slug,
-                        stage: ctx.stage,
-                        tool: "pc_fetch",
-                        kind: "original",
-                        args: &argv,
-                        asked_at: &at,
-                        status: "fail",
-                        error: Some(&why),
-                        title: raw,
-                        url: &final_url,
-                        via: "pc",
-                        route: "pc",
-                        engine: ctx.run.engine,
-                        run: &ctx.run.id,
-                        parts: vec![],
-                        binary: None,
-                        requery: json!({ "주소": raw }),
-                    };
-                    let id = self.record(ctx, &rec).await?;
+                    let id = self
+                        .record(
+                            ctx,
+                            &Rec::fail(ctx, "pc_fetch", &argv, &at, &why, &final_url),
+                        )
+                        .await?;
                     return Err(format!("{why} (근거 기록 {id})"));
                 }
             }
@@ -805,10 +900,10 @@ impl Local {
         } else {
             String::new()
         };
-        let title = if title.is_empty() {
+        let title: String = if title.is_empty() {
             final_url.chars().take(200).collect()
         } else {
-            title.chars().take(200).collect::<String>()
+            title.chars().take(200).collect()
         };
         let (parts, binary) = if is_text && utf8 {
             (
@@ -859,7 +954,7 @@ impl Local {
             ));
         }
         if !is_text {
-            // 문서 파일 — 받은 원문 폴더에 두고 kordoc 으로 읽게 한다
+            // 문서 파일 — 이 실행의 받은 원문 폴더에 두고 kordoc 으로 읽게 한다
             let last = reqwest::Url::parse(&final_url)
                 .ok()
                 .and_then(|x| {
@@ -868,7 +963,7 @@ impl Local {
                 })
                 .unwrap_or_default();
             let name = safe_name(&format!("{id}-{last}"));
-            std::fs::write(self.docs.join(&name), &bytes).map_err(|e| {
+            std::fs::write(ctx.run.docs.join(&name), &bytes).map_err(|e| {
                 format!("받은 파일을 저장하지 못했어요(근거 기록 {id} 은 남았어요): {e}")
             })?;
             let out = json!({ "evidence_id": id, "status": status, "file": name, "mime": mime, "bytes": bytes.len(), "url": final_url,
@@ -887,13 +982,15 @@ impl Local {
         } else {
             text
         };
-        let mut p = page(&view, 0);
-        if let Some(o) = p.as_object_mut() {
-            o.insert("evidence_id".to_string(), json!(id));
-            o.insert("url".to_string(), json!(final_url));
-            o.insert("title".to_string(), json!(title));
-        }
-        self.remember(ctx, id, view);
+        let p = with(
+            page(&view, 0),
+            [
+                ("evidence_id", json!(id)),
+                ("url", json!(final_url)),
+                ("title", json!(title)),
+            ],
+        );
+        lock(&ctx.run.cache).put(id, view);
         Ok(p)
     }
 
@@ -908,9 +1005,9 @@ impl Local {
             (f.evidence.clone(), f.url.clone())
         };
         let bin = which("kordoc").ok_or("이 컴퓨터에 kordoc 이 없어요.")?;
-        let out_name = format!("{file}.md");
-        let src = self.docs.join(file);
-        let dst = self.docs.join(&out_name);
+        let n = ctx.run.seq.fetch_add(1, Ordering::Relaxed);
+        let src = ctx.run.docs.join(file);
+        let dst = ctx.run.docs.join(format!("{file}.{n}.md")); // 부를 때마다 다른 이름(앞 결과를 덮지 않게)
         let mut args = vec![
             crate::paths::slash(&src),
             "-o".to_string(),
@@ -926,37 +1023,36 @@ impl Local {
             args.push("--ocr".to_string());
         }
         let at = now_iso();
-        let mut c = run_capped(&bin, &args, &self.docs, &[], CLI_SECS).await;
-        let md = std::fs::read(&dst)
-            .ok()
-            .filter(|b| b.len() <= RAW_MAX)
-            .map(|b| String::from_utf8_lossy(&b).into_owned())
-            .unwrap_or_default();
-        let fail = c
-            .spawn_err
-            .take()
-            .or_else(|| {
-                c.timed_out
-                    .then(|| "바꾸기가 너무 오래 걸려 멈췄어요".to_string())
-            })
-            .or_else(|| {
-                (c.code != Some(0)).then(|| {
-                    format!(
-                        "kordoc 이 실패했어요: {}",
-                        String::from_utf8_lossy(&c.stderr)
-                            .chars()
-                            .take(300)
-                            .collect::<String>()
-                    )
-                })
-            });
-        let status = if fail.is_some() {
-            "fail"
-        } else if md.trim().is_empty() {
-            "empty"
-        } else {
-            "ok"
+        let mut c = run_capped(&bin, &args, &ctx.run.docs, &[], CLI_SECS).await;
+        let md = match std::fs::metadata(&dst) {
+            Ok(m) if m.len() > RAW_MAX as u64 => {
+                Err(format!("변환한 글이 너무 커요(한도 {}MB)", RAW_MAX >> 20))
+            }
+            Ok(_) => std::fs::read(&dst)
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .map_err(|e| format!("변환한 글을 읽지 못했어요: {e}")),
+            Err(_) => Err("변환한 글이 없어요".to_string()),
         };
+        let fail = c
+            .failure("kordoc")
+            .map(|f| {
+                format!(
+                    "{f}: {}",
+                    String::from_utf8_lossy(&c.stderr)
+                        .chars()
+                        .take(300)
+                        .collect::<String>()
+                )
+            })
+            .or_else(|| md.as_ref().err().map(String::to_string))
+            .or_else(|| {
+                md.as_ref()
+                    .ok()
+                    .filter(|m| m.trim().is_empty())
+                    .map(|_| "변환한 글이 비어 있어요(스캔본이면 ocr: true)".to_string())
+            });
+        let md = md.unwrap_or_default();
+        let status = if fail.is_some() { "fail" } else { "ok" };
         let argv = json!({ "file": file, "pages": pages, "from_evidence": src_ev });
         let title = format!("{file} (kordoc 변환)");
         let parts = vec![Part {
@@ -987,14 +1083,16 @@ impl Local {
         };
         let id = self.record(ctx, &rec).await?;
         if let Some(f) = fail {
-            return Err(format!("{f} (근거 기록 {id})"));
+            return Err(format!("{f} (근거 기록 {id} — 인용하지 마세요)"));
         }
-        let mut p = page(&md, 0);
-        if let Some(o) = p.as_object_mut() {
-            o.insert("evidence_id".to_string(), json!(id));
-            o.insert("source_evidence".to_string(), json!(src_ev));
-        }
-        self.remember(ctx, id, md);
+        let p = with(
+            page(&md, 0),
+            [
+                ("evidence_id", json!(id)),
+                ("source_evidence", json!(src_ev)),
+            ],
+        );
+        lock(&ctx.run.cache).put(id, md);
         Ok(p)
     }
 
@@ -1004,14 +1102,18 @@ impl Local {
         if !matches!(u.scheme(), "http" | "https") {
             return Err("http(s) 주소만 열어요.".to_string());
         }
-        self.check_host(&u).await?;
+        self.guard.check_url(&u).await?;
+        let profile = self
+            .ego_profile
+            .as_deref()
+            .ok_or("「PES」 프로필이 없어요.")?;
         let bin = which("ego-browser").ok_or("이 컴퓨터에 ego-browser 가 없어요.")?;
-        let script = ego_script(u.as_str());
+        let script = ego_script(u.as_str(), profile);
         let at = now_iso();
-        let mut c = run_capped(
+        let c = run_capped(
             &bin,
             &["nodejs".to_string(), "-e".to_string(), script],
-            &self.docs,
+            &ctx.run.docs,
             &[],
             120,
         )
@@ -1027,36 +1129,32 @@ impl Local {
             .and_then(|j| serde_json::from_str(j).ok());
         let argv = json!({ "url": raw });
         let Some(r) = got else {
-            let why = c.spawn_err.take().unwrap_or_else(|| {
+            let why = c.spawn_err.unwrap_or_else(|| {
                 format!(
                     "페이지를 읽지 못했어요: {}",
                     all.trim().chars().take(300).collect::<String>()
                 )
             });
-            let rec = Rec {
-                slug: ctx.slug,
-                stage: ctx.stage,
-                tool: "pc_ego_read",
-                kind: "original",
-                args: &argv,
-                asked_at: &at,
-                status: "fail",
-                error: Some(&why),
-                title: raw,
-                url: raw,
-                via: "pc",
-                route: "pc",
-                engine: ctx.run.engine,
-                run: &ctx.run.id,
-                parts: vec![],
-                binary: None,
-                requery: json!({ "주소": raw }),
-            };
-            let id = self.record(ctx, &rec).await?;
+            let id = self
+                .record(ctx, &Rec::fail(ctx, "pc_ego_read", &argv, &at, &why, raw))
+                .await?;
             return Err(format!("{why} (실패도 근거 기록 {id} 로 남았어요)"));
         };
         let s = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or_default();
         let final_url = if s("url").is_empty() { raw } else { s("url") };
+        // 페이지가 넘긴 곳(최종 주소)도 다시 본다 — 내부 주소면 내용을 쓰지 않는다
+        let inside = match reqwest::Url::parse(final_url) {
+            Ok(fu) => self.guard.check_url(&fu).await.err(),
+            Err(_) => Some("최종 주소를 읽지 못했어요".to_string()),
+        };
+        if let Some(why) = inside {
+            let why = format!("브라우저가 넘어간 주소를 쓸 수 없어요: {why}");
+            let id = self
+                .record(ctx, &Rec::fail(ctx, "pc_ego_read", &argv, &at, &why, raw))
+                .await?;
+            return Err(format!("{why} (근거 기록 {id})"));
+        }
+        let code = r.get("status").and_then(Value::as_i64);
         let title: String = s("title").chars().take(200).collect();
         let mut view = s("text").to_string();
         if let Some(links) = r.get("links").and_then(Value::as_array) {
@@ -1075,7 +1173,10 @@ impl Local {
                 view.push_str(&l.join("\n"));
             }
         }
-        let status = if view.trim().is_empty() {
+        let fail = code.filter(|c| *c >= 400).map(|c| format!("HTTP {c}"));
+        let status = if fail.is_some() {
+            "fail"
+        } else if view.trim().is_empty() {
             "empty"
         } else {
             "ok"
@@ -1083,7 +1184,7 @@ impl Local {
         let parts = vec![Part {
             url: final_url,
             at: &at,
-            status: Some(200),
+            status: code,
             mime: "text/html; charset=utf-8",
             body: s("html"),
         }];
@@ -1095,7 +1196,7 @@ impl Local {
             args: &argv,
             asked_at: &at,
             status,
-            error: None,
+            error: fail.as_deref(),
             title: if title.is_empty() { final_url } else { &title },
             url: final_url,
             via: "pc",
@@ -1107,15 +1208,33 @@ impl Local {
             requery: json!({ "주소": raw, "받은 주소": final_url }),
         };
         let id = self.record(ctx, &rec).await?;
-        let mut p = page(&view, 0);
-        if let Some(o) = p.as_object_mut() {
-            o.insert("evidence_id".to_string(), json!(id));
-            o.insert("url".to_string(), json!(final_url));
-            o.insert("title".to_string(), json!(title));
+        if let Some(f) = fail {
+            return Err(format!(
+                "{f} — 이 실패도 근거 기록 {id} 로 남았어요(인용하지 마세요)."
+            ));
         }
-        self.remember(ctx, id, view);
+        let p = with(
+            page(&view, 0),
+            [
+                ("evidence_id", json!(id)),
+                ("url", json!(final_url)),
+                ("title", json!(title)),
+                ("http_status", json!(code)),
+            ],
+        );
+        lock(&ctx.run.cache).put(id, view);
         Ok(p)
     }
+}
+
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut s = e.to_string();
+    let mut src = e.source();
+    while let Some(x) = src {
+        s.push_str(&format!(" — {x}"));
+        src = x.source();
+    }
+    s
 }
 
 struct Ctx<'a> {
@@ -1124,30 +1243,18 @@ struct Ctx<'a> {
     stage: Option<&'a str>,
 }
 
-/// 근거 기록의 도구 이름 — PC 에서 연 것은 pc_ 를 붙여 서버 도구와 구별한다
-fn tool_name(tool: &str) -> &'static str {
-    match tool {
-        "kosis" => "pc_kosis",
-        "vworld" => "pc_vworld",
-        "sgis" => "pc_sgis",
-        "korean_law" => "pc_korean_law",
-        _ => "pc_cli",
-    }
-}
-
-/// ego-browser 스크립트 — 브리지가 만든다(AI 가 준 JavaScript 는 돌리지 않는다). 공개 페이지를 열어 읽고 탭을 닫는다
-fn ego_script(url: &str) -> String {
+/// ego-browser 스크립트 — 브리지가 만든다(AI 가 준 JavaScript 는 돌리지 않는다). 「PES」 프로필로만 열고, 응답 코드를 받아 적고, 탭을 닫는다
+fn ego_script(url: &str, profile: &str) -> String {
     let u = serde_json::to_string(url).unwrap_or_else(|_| "\"\"".to_string());
+    let p = serde_json::to_string(profile).unwrap_or_else(|_| "\"\"".to_string());
     format!(
         r#"const want = {u};
-let pid = null;
-try {{ const ps = await profiles(); pid = (ps || []).find((p) => /^pes$/i.test(String(p.name || "").trim()))?.id ?? null }} catch {{}}
-const task = pid ? await taskSpace("PES 외부 AI", {{ profileId: pid }}) : await taskSpace("PES 외부 AI");
+const task = await taskSpace("PES 외부 AI", {{ profileId: {p} }});
 const page = await task.newPage();
 try {{
   await page.goto(want, {{ timeout: 60000 }});
   try {{ await page.waitForLoadState("networkidle", {{ timeout: 15000 }}) }} catch {{}}
-  const r = await page.evaluate(() => ({{ url: location.href, title: document.title, html: document.documentElement.outerHTML, text: document.body ? document.body.innerText : "", links: [...document.querySelectorAll("a[href]")].slice(0, 2000).map((a) => [String(a.innerText || "").trim().slice(0, 200), a.href]) }}));
+  const r = await page.evaluate(() => {{ const nav = performance.getEntriesByType("navigation")[0]; return {{ url: location.href, status: nav && nav.responseStatus ? nav.responseStatus : null, title: document.title, html: document.documentElement.outerHTML, text: document.body ? document.body.innerText : "", links: [...document.querySelectorAll("a[href]")].slice(0, 2000).map((a) => [String(a.innerText || "").trim().slice(0, 200), a.href]) }} }});
   console.log("PES_EGO_RESULT " + JSON.stringify(r));
 }} finally {{ try {{ await page.close() }} catch {{}} }}"#
     )
@@ -1167,7 +1274,6 @@ fn json_resp(status: StatusCode, v: &Value) -> Response {
 
 async fn handle(
     State(l): State<Arc<Local>>,
-    UrlPath(token): UrlPath<String>,
     method: Method,
     headers: HeaderMap,
     body: Bytes,
@@ -1189,7 +1295,12 @@ async fn handle(
     if method != Method::POST {
         return (StatusCode::METHOD_NOT_ALLOWED, [(header::ALLOW, "POST")]).into_response();
     }
-    let Some(run) = l.find(&token) else {
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or_default();
+    let Some(run) = l.find(token) else {
         return json_resp(
             StatusCode::UNAUTHORIZED,
             &json!({ "error": "실행 토큰이 맞지 않아요(실행이 끝났을 수 있어요)." }),
@@ -1249,22 +1360,12 @@ mod tests {
     }
 
     #[test]
-    fn internal_hosts_blocked() -> Result<(), Box<dyn std::error::Error>> {
-        for u in [
-            "http://127.0.0.1:8765/",
-            "http://localhost/",
-            "http://10.1.2.3/",
-            "http://192.168.0.1/",
-            "http://[::1]/",
-            "http://169.254.169.254/",
-            "http://100.64.0.1/",
-        ] {
-            assert!(blocked_host(&reqwest::Url::parse(u)?), "{u}");
-        }
-        for u in ["https://kosis.kr/", "https://8.8.8.8/"] {
-            assert!(!blocked_host(&reqwest::Url::parse(u)?), "{u}");
-        }
-        Ok(())
+    fn cache_drops_oldest_over_limit() {
+        let mut c = Cache::default();
+        c.put("a".into(), "x".repeat(CACHE_MAX / 2 + 1));
+        c.put("b".into(), "y".repeat(CACHE_MAX / 2 + 1));
+        assert!(c.get("a").is_none() && c.get("b").is_some());
+        assert!(c.bytes <= CACHE_MAX);
     }
 
     #[test]
@@ -1279,5 +1380,48 @@ mod tests {
     fn names_are_safe() {
         assert_eq!(safe_name("ev_x-../../etc/passwd"), "ev_x-.._.._etc_passwd");
         assert_eq!(safe_name(""), "file");
+    }
+
+    #[test]
+    fn capped_failures() {
+        let mut c = Capped {
+            code: Some(0),
+            read_err: true,
+            ..Capped::default()
+        };
+        assert!(
+            c.failure("kosis")
+                .is_some_and(|f| f.contains("끝까지 읽지 못했어요"))
+        );
+        let mut ok = Capped {
+            code: Some(0),
+            ..Capped::default()
+        };
+        assert!(ok.failure("kosis").is_none());
+    }
+
+    #[tokio::test]
+    async fn cli_timeout_kills_the_whole_group() -> Result<(), Box<dyn std::error::Error>> {
+        let d = tempfile::tempdir()?;
+        let pidf = d.path().join("child.pid");
+        // 손자 프로세스가 출력 줄을 붙잡고 오래 잔다 — 시간이 넘으면 묶음째 끝나야 한다
+        let script = format!("sleep 300 & echo $! > {}; wait", pidf.display());
+        let c = run_capped(
+            Path::new("/bin/sh"),
+            &["-c".to_string(), script],
+            d.path(),
+            &[],
+            1,
+        )
+        .await;
+        assert!(c.timed_out);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let pid = std::fs::read_to_string(&pidf)?.trim().to_string();
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid])
+            .status()?
+            .success();
+        assert!(!alive, "손자 프로세스 {pid} 가 살아 있어요");
+        Ok(())
     }
 }

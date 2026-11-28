@@ -101,6 +101,10 @@ pub fn parse(engine: Engine, m: &Value) -> Vec<Ev> {
                         }
                     }
                     "error" => out.push(Ev::Fail(s(it, "/message"))),
+                    // 하위 에이전트(협업 도구 · spawn_agent 등) — 감지에 넘긴다
+                    t if started && (t.contains("collab") || t.contains("agent")) => {
+                        out.push(Ev::Tool("subagent".to_string(), Some(t.to_string())))
+                    }
                     _ => {}
                 },
                 "turn.failed" => out.push(Ev::Fail(s(m, "/error/message"))),
@@ -122,11 +126,13 @@ pub fn parse(engine: Engine, m: &Value) -> Vec<Ev> {
                 if s(m, "/part/state/status") == "running" {
                     out.push(Ev::Phase("tool", Some(t)));
                 } else {
+                    // 셸은 command, code mode(execute)는 code — 감지에서 둘 다 본다
+                    let input = m
+                        .pointer("/part/state/input/command")
+                        .or_else(|| m.pointer("/part/state/input/code"));
                     out.push(Ev::Tool(
                         t,
-                        m.pointer("/part/state/input/command")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
+                        input.and_then(Value::as_str).map(str::to_string),
                     ));
                 }
             }
@@ -146,6 +152,47 @@ pub fn parse(engine: Engine, m: &Value) -> Vec<Ev> {
     }
     out
 }
+
+/// PES MCP 도구 이름(pes-web src/mcp.ts TOOLS, 2026-11-28) — OpenCode 의 pes_<도구> 이름을 가린다
+const PES_TOOLS: [&str; 37] = [
+    "list_projects",
+    "get_project",
+    "list_items",
+    "get_item",
+    "search",
+    "update_item",
+    "edit_blocks",
+    "list_report_kinds",
+    "create_project",
+    "get_start_questions",
+    "answer_start_questions",
+    "answer_review",
+    "approve_stage",
+    "answer_chat",
+    "get_chat_file",
+    "send_instruction",
+    "pending_work",
+    "my_docs_search",
+    "law_notice_search",
+    "law_notice_text",
+    "keep_source",
+    "rag_pending_docs",
+    "rag_doc",
+    "rag_annotate",
+    "get_skill",
+    "get_place_jobs",
+    "get_place_job",
+    "submit_place",
+    "get_polish",
+    "submit_polish",
+    "start_round",
+    "merge_items",
+    "submit_round",
+    "list_memory",
+    "add_memory",
+    "make_image",
+    "read_more",
+];
 
 /// 셸 감싸개(/bin/zsh -lc '…' · bash -c "…")를 벗긴다
 fn unwrap_shell(cmd: &str) -> &str {
@@ -175,10 +222,21 @@ fn unwrap_shell(cmd: &str) -> &str {
 /// 셸 명령이 허용한 보조 명령(jq · grep · cat)만으로 되어 있나 — 파이프 · && · ; 로 나눈 마디마다 본다
 pub fn shell_ok(cmd: &str) -> bool {
     let c = unwrap_shell(cmd);
-    if c.contains('`') || c.contains("$(") || c.contains('>') {
+    // 작은따옴표 안은 셸이 풀지 않는다 — 비운다(jq '.a | select(.b)' 같은 식이 걸리지 않게)
+    let s1 = mask(c, '\'');
+    // 명령 치환은 큰따옴표 안에서도 돈다
+    if ["`", "$(", "${"].iter().any(|x| s1.contains(x)) {
         return false;
     }
-    c.split(['|', ';', '&', '\n'])
+    let s2 = mask(&s1, '"');
+    // 프로세스 치환 · 하위 셸 · 리다이렉션 · 묶음 · 줄 이음은 보조 명령 밖이다
+    if ["<(", ">(", ">", "<", "(", ")", "{", "}", "\\"]
+        .iter()
+        .any(|x| s2.contains(x))
+    {
+        return false;
+    }
+    s2.split(['|', ';', '&', '\n'])
         .map(str::trim)
         .filter(|x| !x.is_empty())
         .all(|seg| {
@@ -188,19 +246,33 @@ pub fn shell_ok(cmd: &str) -> bool {
         })
 }
 
+/// 따옴표 q 로 묶인 곳의 안을 빈칸으로(따옴표는 남긴다)
+fn mask(s: &str, q: char) -> String {
+    let mut inside = false;
+    s.chars()
+        .map(|ch| {
+            if ch == q {
+                inside = !inside;
+                ch
+            } else if inside {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
 /// 도구 사용 하나가 PES 밖 조사 흔적인가 → 그렇다면 {tool, command?, why}
 pub fn outside(engine: Engine, name: &str, command: Option<&str>) -> Option<Value> {
     let n = name.trim();
     let lower = n.to_ascii_lowercase();
-    let pes_tool = [
-        "mcp__pes__",
-        "mcp__pes_local__",
-        "pes_",
-        "pes.",
-        "pes_local.",
-    ]
-    .iter()
-    .any(|p| n.starts_with(p));
+    // PES 도구: Claude · Codex 는 mcp__<서버>__<도구>, OpenCode 는 <서버>_<도구>. 서버는 pes · pes_local 만
+    let pes_tool = n.starts_with("mcp__pes__")
+        || n.starts_with("mcp__pes_local__")
+        || n.starts_with("pes_local_")
+        || n.strip_prefix("pes_")
+            .is_some_and(|t| PES_TOOLS.contains(&t));
     // 내장 웹 검색은 켜 둔다(단서용) — 감지 대상이 아니다. 파일 읽기 도구는 작업 폴더 안으로 갇혀 있다
     let plain = matches!(
         lower.as_str(),
@@ -213,6 +285,7 @@ pub fn outside(engine: Engine, name: &str, command: Option<&str>) -> Option<Valu
             | "todowrite"
             | "todoread"
             | "yield"
+            | "skill"
     );
     let why = if pes_tool || plain {
         None
@@ -228,7 +301,22 @@ pub fn outside(engine: Engine, name: &str, command: Option<&str>) -> Option<Valu
     } else if lower == "task" || lower == "agent" || lower == "subagent" {
         Some("하위 에이전트")
     } else if engine == Engine::OpenCode && (lower == "execute" || lower == "codemode") {
-        None // OpenCode code mode — 안에서 부르는 MCP 도구는 따로 잡히지 않는다(한계)
+        // OpenCode code mode — 안의 MCP 호출은 따로 잡히지 않는다(한계). 코드에 네트워크 · 프로세스 흔적이 있으면 표시한다
+        let code = command.unwrap_or_default().to_ascii_lowercase();
+        [
+            "fetch(",
+            "http://",
+            "https://",
+            "webfetch",
+            "child_process",
+            "xmlhttprequest",
+            "websocket",
+            "bun.spawn",
+            "deno.run",
+        ]
+        .iter()
+        .any(|k| code.contains(k))
+        .then_some("code mode 안의 네트워크 · 프로세스 흔적")
     } else {
         Some("허용 밖 도구")
     };
@@ -301,5 +389,53 @@ mod tests {
         assert!(outside(Engine::OpenCode, "webfetch", None).is_some());
         assert!(outside(Engine::OpenCode, "task", None).is_some());
         assert!(outside(Engine::Codex, "Bash", Some("/bin/zsh -lc 'python3 -c 1'")).is_some());
+    }
+
+    #[test]
+    fn review_cases() {
+        assert!(!shell_ok("cat <(curl -s https://x)"));
+        assert!(!shell_ok("grep x ${HOME}/.ssh/id_rsa > /dev/null"));
+        assert!(!shell_ok("(curl x)"));
+        assert!(
+            shell_ok("jq '.rows | map(select(.v > 1))' a.json"),
+            "작은따옴표 안의 jq 식은 괜찮다"
+        );
+        assert!(!shell_ok("grep \"$(curl x)\" a"));
+        assert!(outside(Engine::OpenCode, "pes_merge_items", None).is_none());
+        assert!(outside(Engine::OpenCode, "pes_local_kosis", None).is_none());
+        assert!(
+            outside(Engine::OpenCode, "pes_evil_tool", None).is_some(),
+            "pes_ 로 시작해도 PES 도구가 아니면 흔적"
+        );
+        assert!(outside(Engine::OpenCode, "skill", None).is_none());
+        assert!(
+            outside(
+                Engine::OpenCode,
+                "execute",
+                Some("await fetch('https://x')")
+            )
+            .is_some()
+        );
+        assert!(
+            outside(
+                Engine::OpenCode,
+                "execute",
+                Some("await tools.pes_local.kosis({})")
+            )
+            .is_none()
+        );
+        let c =
+            json!({"type":"item.started","item":{"type":"collab_tool_call","tool":"spawn_agent"}});
+        let evs = parse(Engine::Codex, &c);
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, Ev::Tool(n, _) if n == "subagent"))
+        );
+        assert!(outside(Engine::Codex, "subagent", Some("collab_tool_call")).is_some());
+        let x = json!({"type":"tool_use","part":{"tool":"execute","state":{"status":"completed","input":{"code":"fetch('https://a')"}}}});
+        assert!(parse(Engine::OpenCode, &x).contains(&Ev::Tool(
+            "execute".into(),
+            Some("fetch('https://a')".into())
+        )));
     }
 }

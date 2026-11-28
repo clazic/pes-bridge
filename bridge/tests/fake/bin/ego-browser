@@ -1,4 +1,9 @@
 #!/bin/sh
-# 가짜 ego-browser — nodejs -e <스크립트> 를 받으면 스크립트 안의 주소로 연 척한다(시험용)
+# 가짜 ego-browser — nodejs -e <스크립트>. 프로필 묻기에는 「PES」 프로필 번호를(FAKE_EGO_NO_PES=1 이면 없음), 페이지 열기에는 연 척한 결과를(시험용)
+case "$3" in
+  *PES_EGO_PROFILE*)
+    if [ "$FAKE_EGO_NO_PES" = "1" ]; then echo 'PES_EGO_PROFILE null'; else echo 'PES_EGO_PROFILE "prof-pes"'; fi
+    exit 0 ;;
+esac
 url=$(printf '%s' "$3" | sed -n 's/^const want = "\(.*\)";$/\1/p')
-printf 'PES_EGO_RESULT {"url":"%s","title":"브라우저 화면","html":"<html><body><div id=app>표 화면 값 42</div></body></html>","text":"표 화면 값 42","links":[["다음","%s#2"]]}\n' "$url" "$url"
+printf 'PES_EGO_RESULT {"url":"%s","status":200,"title":"브라우저 화면","html":"<html><body><div id=app>표 화면 값 42</div></body></html>","text":"표 화면 값 42","links":[["다음","%s#2"]]}\n' "$url" "$url"

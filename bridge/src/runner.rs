@@ -16,6 +16,10 @@ pub struct Limits {
     pub idle: Duration,
     /// 한 번 실행이 이만큼 넘으면 끝낸다
     pub max: Duration,
+    /// 멈춤 확인 간격
+    pub tick: Duration,
+    /// 끝낸 뒤 이만큼 지나도 출력 줄이 안 닫히면 읽기를 멈추고 빠져나온다
+    pub grace: Duration,
 }
 
 impl Limits {
@@ -30,6 +34,8 @@ impl Limits {
         Self {
             idle: Duration::from_secs(mins("PES_BRIDGE_IDLE_MIN", 10) * 60),
             max: Duration::from_secs(mins("PES_BRIDGE_ROUND_MAX_MIN", 120) * 60),
+            tick: Duration::from_secs(10),
+            grace: Duration::from_secs(10),
         }
     }
 }
@@ -100,6 +106,8 @@ pub async fn run(job: &Job<'_>, pes: Arc<Pes>, slugs: &[String], limits: &Limits
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // 새 프로세스 묶음 — 멈추면 AI 가 띄운 셸 · 도구까지 묶음째 끝낸다
+    crate::proc::own_group(&mut cmd);
     for k in job.remove {
         cmd.env_remove(k);
     }
@@ -136,7 +144,9 @@ pub async fn run(job: &Job<'_>, pes: Arc<Pes>, slugs: &[String], limits: &Limits
     beat.send(true);
     let began = Instant::now();
     let mut seen = Instant::now();
-    let mut tick = tokio::time::interval(Duration::from_secs(10));
+    let pid = child.id();
+    let mut tick = tokio::time::interval(limits.tick);
+    let mut killed_at: Option<Instant> = None;
     let (mut out_done, mut err_done) = (false, false);
     let mut err_tail = String::new();
     let mut killed: Option<String> = None;
@@ -178,16 +188,29 @@ pub async fn run(job: &Job<'_>, pes: Arc<Pes>, slugs: &[String], limits: &Limits
                 _ => err_done = true,
             },
             _ = tick.tick() => {
-                if killed.is_none() {
+                if let Some(at) = killed_at {
+                    if at.elapsed() > limits.grace {
+                        line(&format!("{} 끝낸 뒤 {}초가 지나도 출력이 닫히지 않아 읽기를 멈춰요", job.label, limits.grace.as_secs()));
+                        break None;
+                    }
+                } else {
                     let why = if seen.elapsed() > limits.idle {
-                        Some(format!("{}분 동안 응답이 없어 멈췄어요", limits.idle.as_secs() / 60))
+                        Some(format!("{}초 동안 응답이 없어 멈췄어요", limits.idle.as_secs()))
                     } else if began.elapsed() > limits.max {
                         Some(format!("{}분이 넘어 멈췄어요", limits.max.as_secs() / 60))
                     } else { None };
                     if let Some(w) = why {
                         line(&format!("{} {w} — 끝내요", job.label));
-                        let _ = child.start_kill();
+                        match pid.map(crate::proc::kill_tree) {
+                            Some(Ok(())) => {}
+                            Some(Err(e)) => line(&format!("{} {e}", job.label)),
+                            None => line(&format!("{} 프로세스 번호를 몰라 묶음째 끝내지 못했어요", job.label)),
+                        }
+                        if let Err(e) = child.start_kill() {
+                            line(&format!("{} AI 프로세스를 끝내지 못했어요: {e}", job.label));
+                        }
                         killed = Some(w);
+                        killed_at = Some(Instant::now());
                     } else if seen.elapsed() < Duration::from_secs(180) {
                         beat.send(true);
                     }
@@ -234,4 +257,68 @@ pub async fn run(job: &Job<'_>, pes: Arc<Pes>, slugs: &[String], limits: &Limits
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 출력 없이 멈춘 AI(손자 프로세스가 출력 줄을 붙잡음)는 묶음째 끝나고, 늦어도 grace 뒤에는 빠져나온다
+    #[tokio::test]
+    async fn stuck_ai_is_killed_with_its_children() -> Result<(), Box<dyn std::error::Error>> {
+        let d = tempfile::tempdir()?;
+        let acc = d.path().join("a1");
+        std::fs::create_dir_all(&acc)?;
+        std::fs::write(acc.join("key"), "pes_testkey0123456789abcdefgh")?;
+        let pes = Arc::new(Pes::new(
+            "http://127.0.0.1:9".to_string(),
+            crate::account::Account {
+                id: "a1".to_string(),
+                dir: acc,
+            },
+        )?);
+        let pidf = d.path().join("child.pid");
+        let args = vec![
+            "-c".to_string(),
+            format!("sleep 300 & echo $! > {}; sleep 300", pidf.display()),
+        ];
+        let job = Job {
+            engine: Engine::Claude,
+            bin: Path::new("/bin/sh"),
+            args: &args,
+            env: &[],
+            remove: &[],
+            prompt: "",
+            cwd: d.path(),
+            label: "[시험]",
+        };
+        let limits = Limits {
+            idle: Duration::from_secs(1),
+            max: Duration::from_secs(60),
+            tick: Duration::from_millis(200),
+            grace: Duration::from_secs(2),
+        };
+        let t = Instant::now();
+        let out = run(&job, pes, &[], &limits).await;
+        assert!(
+            t.elapsed() < Duration::from_secs(10),
+            "늦게 빠져나왔어요: {:?}",
+            t.elapsed()
+        );
+        assert!(
+            out.error
+                .as_deref()
+                .is_some_and(|e| e.contains("응답이 없어")),
+            "{:?}",
+            out.error
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let pid = std::fs::read_to_string(&pidf)?.trim().to_string();
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid])
+            .status()?
+            .success();
+        assert!(!alive, "손자 프로세스 {pid} 가 살아 있어요");
+        Ok(())
+    }
 }
