@@ -36,6 +36,8 @@ pub const PAGE: usize = 40_000;
 /// 이어 읽기용으로 한 실행이 들고 있는 글의 한도 — 넘으면 오래된 것부터 버린다
 const CACHE_MAX: usize = 64 * 1024 * 1024;
 const CLI_SECS: u64 = 600;
+/// 이보다 큰 원본은 한 번에 보내지 않고 바이트 그대로 조각으로 나눠 올린다(사용자 결정 2026-11-28, PES-API.md 5절)
+pub const UPLOAD_OVER: usize = 1024 * 1024;
 
 /// 조사 CLI — (도구 이름, 안내)
 const CLIS: [(&str, &str); 4] = [
@@ -78,25 +80,26 @@ struct FileRec {
 /// 이어 읽기용 글 — 크기 한도 안에서 오래된 것부터 버린다
 #[derive(Default)]
 struct Cache {
-    items: VecDeque<(String, String)>,
+    /// (근거 번호, 프로젝트, AI 가 읽는 글)
+    items: VecDeque<(String, String, String)>,
     bytes: usize,
 }
 
 impl Cache {
-    fn put(&mut self, id: String, text: String) {
+    fn put(&mut self, id: String, slug: &str, text: String) {
         self.bytes += text.len();
-        self.items.push_back((id, text));
+        self.items.push_back((id, slug.to_string(), text));
         while self.bytes > CACHE_MAX && self.items.len() > 1 {
-            if let Some((_, t)) = self.items.pop_front() {
+            if let Some((_, _, t)) = self.items.pop_front() {
                 self.bytes -= t.len();
             }
         }
     }
-    fn get(&self, id: &str) -> Option<&str> {
+    fn get(&self, id: &str) -> Option<(&str, &str)> {
         self.items
             .iter()
-            .find(|(i, _)| i == id)
-            .map(|(_, t)| t.as_str())
+            .find(|(i, _, _)| i == id)
+            .map(|(_, s, t)| (s.as_str(), t.as_str()))
     }
 }
 
@@ -136,7 +139,11 @@ struct Binary<'a> {
     at: &'a str,
     status: Option<i64>,
     mime: &'a str,
-    b64: String,
+    /// 원본 바이트 — 작으면 record 가 b64 로 바꿔 싣고, 크면 나눠 올린다
+    #[serde(skip)]
+    bytes: &'a [u8],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    b64: Option<String>,
 }
 
 /// 근거 기록 하나 — PES 에 올리는 꼴(bridge/PES-API.md)
@@ -161,6 +168,12 @@ struct Rec<'a> {
     run: &'a str,
     parts: Vec<Part<'a>>,
     binary: Option<Binary<'a>>,
+    /// 나눠 올린 원본 {file_id, sha256, size, mime, url, at, status} — 있으면 원본은 그 파일, parts 는 덧붙은 작은 글만
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upload: Option<Value>,
+    /// AI 에게 준 첫 쪽 범위 {chars, ranges: [[0, n]], pages}
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seen: Option<Value>,
     requery: Value,
 }
 
@@ -190,6 +203,8 @@ impl<'a> Rec<'a> {
             run: &ctx.run.id,
             parts: vec![],
             binary: None,
+            upload: None,
+            seen: None,
             requery: json!({ "주소": url }),
         }
     }
@@ -630,7 +645,7 @@ impl Local {
 
     async fn call(&self, run: &Run, name: &str, a: &Value) -> Result<Value, String> {
         if name == "read_more" {
-            return Self::read_more(run, a);
+            return self.read_more(run, a).await;
         }
         let slug = str_arg(a, "slug").ok_or("slug 가 필요해요.")?;
         if !run.slugs.iter().any(|s| s == slug) {
@@ -653,11 +668,20 @@ impl Local {
         }
     }
 
-    /// 근거 기록을 올리고 번호를 받는다. 못 받으면 Err — 그 호출은 실패로 돌려준다
-    async fn record(&self, ctx: &Ctx<'_>, rec: &Rec<'_>) -> Result<String, String> {
-        let v =
-            serde_json::to_value(rec).map_err(|e| format!("근거 기록을 만들지 못했어요: {e}"))?;
-        match self.pes.evidence(&v).await {
+    /// 근거 기록을 올리고 번호를 받는다. 못 받으면 Err — 그 호출은 실패로 돌려준다.
+    /// view_chars: AI 에게 줄 글의 길이(첫 쪽 범위를 seen 으로 함께 보낸다). 원본이 UPLOAD_OVER 보다 크면 먼저 나눠 올린다
+    async fn record(
+        &self,
+        ctx: &Ctx<'_>,
+        mut rec: Rec<'_>,
+        view_chars: Option<usize>,
+    ) -> Result<String, String> {
+        if let Some(n) = view_chars.filter(|n| *n > 0) {
+            rec.seen = Some(json!({ "chars": n, "ranges": [[0, n.min(PAGE)]], "pages": 1 }));
+        }
+        let tool = rec.tool;
+        let url = rec.url;
+        match self.send_record(ctx, &mut rec).await {
             Ok(id) => {
                 // clone: 번호는 실행 통계(작업 로그)와 도구 답 두 곳에 들어간다
                 lock(&ctx.run.stats).recorded.push(id.clone());
@@ -667,13 +691,12 @@ impl Local {
                 lock(&ctx.run.stats).upload_failed += 1;
                 let why = format!("{e:#}");
                 line(&format!(
-                    "pes_local {}: 근거 기록을 PES 에 올리지 못했어요 — {why}",
-                    rec.tool
+                    "pes_local {tool}: 근거 기록을 PES 에 올리지 못했어요 — {why}"
                 ));
                 let ev = Event {
-                    action: "bridge_evidence_fail", project: Some(ctx.slug), stage: ctx.stage, target: Some(rec.tool), how: format!("pes_local {} → POST /mcp/evidence", rec.tool),
+                    action: "bridge_evidence_fail", project: Some(ctx.slug), stage: ctx.stage, target: Some(tool), how: format!("pes_local {tool} → POST /mcp/evidence"),
                     why_kind: "rule", why: "PC 에서 한 조회는 원본을 PES 근거 기록으로 올려야 성공으로 친다(티켓 21 · 22)".to_string(), result: "fail",
-                    detail: json!({ "error": why, "url": rec.url, "run": ctx.run.id }),
+                    detail: json!({ "error": why, "url": url, "run": ctx.run.id }),
                 };
                 if let Err(e2) = self.pes.bridge_log(&ev.to_json()).await {
                     line(&format!("작업 로그도 올리지 못했어요: {e2:#}"));
@@ -685,18 +708,79 @@ impl Local {
         }
     }
 
-    fn read_more(run: &Run, a: &Value) -> Result<Value, String> {
+    /// 원본 크기에 따라 한 번에(글 · base64) 또는 나눠 올린 뒤 근거 기록을 만든다
+    async fn send_record(&self, ctx: &Ctx<'_>, rec: &mut Rec<'_>) -> anyhow::Result<String> {
+        let size = rec.binary.as_ref().map_or_else(
+            || rec.parts.iter().map(|p| p.body.len()).sum(),
+            |b| b.bytes.len(),
+        );
+        let mut expect: Option<String> = None;
+        if size <= UPLOAD_OVER {
+            if let Some(b) = rec.binary.as_mut() {
+                b.b64 = Some(STANDARD.encode(b.bytes));
+            }
+        } else {
+            // 원본(바이트 그대로)을 먼저 나눠 올리고, 근거 기록은 그 파일 번호와 지문으로 만든다
+            let (bytes, mime, url, at, status) = match rec.binary.take() {
+                Some(b) => (b.bytes, b.mime, b.url, b.at, b.status),
+                None if !rec.parts.is_empty() => {
+                    let p = rec.parts.remove(0);
+                    (p.body.as_bytes(), p.mime, p.url, p.at, p.status)
+                }
+                None => (
+                    &[][..],
+                    "application/octet-stream",
+                    rec.url,
+                    rec.asked_at,
+                    None,
+                ),
+            };
+            let name = safe_name(&format!("{}-{}.raw", rec.tool, ctx.run.id));
+            let (file_id, sha) = self.pes.upload_raw(ctx.slug, &name, mime, bytes).await?;
+            rec.upload = Some(
+                json!({ "file_id": file_id, "sha256": sha, "size": bytes.len(), "mime": mime, "url": url, "at": at, "status": status }),
+            );
+            expect = Some(sha);
+        }
+        let v = serde_json::to_value(&*rec)?;
+        self.pes.evidence(&v, expect.as_deref()).await
+    }
+
+    /// 이어 읽기 — 준 범위를 PES 에 더한다(POST /mcp/evidence-seen)
+    async fn read_more(&self, run: &Run, a: &Value) -> Result<Value, String> {
         let id = str_arg(a, "evidence_id").ok_or("evidence_id 가 필요해요.")?;
         let from = a
             .get("from")
             .and_then(Value::as_u64)
             .and_then(|n| usize::try_from(n).ok())
             .unwrap_or(0);
-        let cache = lock(&run.cache);
-        let text = cache.get(id).ok_or(
-            "이번 실행에서 받은 결과가 아니거나, 오래돼 지웠어요(같은 도구로 다시 조회하세요).",
-        )?;
-        Ok(with(page(text, from), [("evidence_id", json!(id))]))
+        let (slug, p, total) = {
+            let cache = lock(&run.cache);
+            let (slug, text) = cache.get(id).ok_or(
+                "이번 실행에서 받은 결과가 아니거나, 오래돼 지웠어요(같은 도구로 다시 조회하세요).",
+            )?;
+            let total = text.chars().count();
+            (
+                slug.to_string(),
+                with(page(text, from), [("evidence_id", json!(id))]),
+                total,
+            )
+        };
+        let end = (from + PAGE).min(total);
+        if from < end {
+            // 실패해도 이 도구 결과는 실패로 하지 않는다 — 글은 이미 이 컴퓨터 안에서 AI 에게 주는 중이고, 근거 원본 자체는 올라가 있다.
+            // 그 범위는 PES 에 「본 범위」로 남지 않아, 그 부분을 근거로 다는 것은 PES 검사에서 걸린다(로그로 남긴다)
+            if let Err(e) = self
+                .pes
+                .evidence_seen(&slug, id, total, &[[from, end]])
+                .await
+            {
+                line(&format!(
+                    "pes_local read_more: 본 범위를 PES 에 남기지 못했어요({id} {from}..{end}) — {e:#}"
+                ));
+            }
+        }
+        Ok(p)
     }
 
     async fn cli(&self, ctx: &Ctx<'_>, tool: &str, a: &Value) -> Result<Value, String> {
@@ -799,9 +883,12 @@ impl Local {
             run: &ctx.run.id,
             parts,
             binary: None,
+            upload: None,
+            seen: None,
             requery: json!({ "명령": bin, "인자": argv.get("args") }),
         };
-        let id = self.record(ctx, &rec).await?;
+        let view = fail.is_none().then(|| out.chars().count());
+        let id = self.record(ctx, rec, view).await?;
         if let Some(f) = fail {
             return Err(format!(
                 "{f}. 이 실패도 근거 기록 {id} 로 남았어요(인용하지 마세요). 출력: {}",
@@ -812,7 +899,7 @@ impl Local {
             page(&out, 0),
             [("evidence_id", json!(id)), ("status", json!(status))],
         );
-        lock(&ctx.run.cache).put(id, out);
+        lock(&ctx.run.cache).put(id, ctx.slug, out);
         Ok(p)
     }
 
@@ -830,7 +917,7 @@ impl Local {
             Err(e) => {
                 let why = format!("열지 못했어요: {}", error_chain(&e));
                 let id = self
-                    .record(ctx, &Rec::fail(ctx, "pc_fetch", &argv, &at, &why, raw))
+                    .record(ctx, Rec::fail(ctx, "pc_fetch", &argv, &at, &why, raw), None)
                     .await?;
                 return Err(format!(
                     "{why} (실패도 근거 기록 {id} 로 남았어요 — 인용하지 마세요)"
@@ -864,7 +951,8 @@ impl Local {
                     let id = self
                         .record(
                             ctx,
-                            &Rec::fail(ctx, "pc_fetch", &argv, &at, &why, &final_url),
+                            Rec::fail(ctx, "pc_fetch", &argv, &at, &why, &final_url),
+                            None,
                         )
                         .await?;
                     return Err(format!("{why} (근거 기록 {id})"));
@@ -924,7 +1012,8 @@ impl Local {
                     at: &at,
                     status: Some(code),
                     mime: &mime,
-                    b64: STANDARD.encode(&bytes),
+                    bytes: &bytes,
+                    b64: None,
                 }),
             )
         };
@@ -945,9 +1034,19 @@ impl Local {
             run: &ctx.run.id,
             parts,
             binary,
+            upload: None,
+            seen: None,
             requery: json!({ "주소": raw, "받은 주소": final_url }),
         };
-        let id = self.record(ctx, &rec).await?;
+        // AI 에게 줄 글(HTML 은 읽을 글로) — 첫 쪽 범위를 근거와 함께 보낸다
+        let html_view = (is_text && mime.contains("html"))
+            .then(|| html::to_text(&text, reqwest::Url::parse(&final_url).ok().as_ref()));
+        let chars = (fail.is_none() && is_text).then(|| {
+            html_view
+                .as_ref()
+                .map_or_else(|| text.chars().count(), |v| v.chars().count())
+        });
+        let id = self.record(ctx, rec, chars).await?;
         if let Some(f) = fail {
             return Err(format!(
                 "{f} — 이 실패도 근거 기록 {id} 로 남았어요(인용하지 마세요)."
@@ -977,11 +1076,7 @@ impl Local {
             );
             return Ok(out);
         }
-        let view = if mime.contains("html") {
-            html::to_text(&text, reqwest::Url::parse(&final_url).ok().as_ref())
-        } else {
-            text
-        };
+        let view = html_view.unwrap_or(text);
         let p = with(
             page(&view, 0),
             [
@@ -990,7 +1085,7 @@ impl Local {
                 ("title", json!(title)),
             ],
         );
-        lock(&ctx.run.cache).put(id, view);
+        lock(&ctx.run.cache).put(id, ctx.slug, view);
         Ok(p)
     }
 
@@ -1079,9 +1174,12 @@ impl Local {
             run: &ctx.run.id,
             parts,
             binary: None,
+            upload: None,
+            seen: None,
             requery: json!({ "원본 근거": src_ev, "쪽": pages }),
         };
-        let id = self.record(ctx, &rec).await?;
+        let view = fail.is_none().then(|| md.chars().count());
+        let id = self.record(ctx, rec, view).await?;
         if let Some(f) = fail {
             return Err(format!("{f} (근거 기록 {id} — 인용하지 마세요)"));
         }
@@ -1092,7 +1190,7 @@ impl Local {
                 ("source_evidence", json!(src_ev)),
             ],
         );
-        lock(&ctx.run.cache).put(id, md);
+        lock(&ctx.run.cache).put(id, ctx.slug, md);
         Ok(p)
     }
 
@@ -1136,7 +1234,11 @@ impl Local {
                 )
             });
             let id = self
-                .record(ctx, &Rec::fail(ctx, "pc_ego_read", &argv, &at, &why, raw))
+                .record(
+                    ctx,
+                    Rec::fail(ctx, "pc_ego_read", &argv, &at, &why, raw),
+                    None,
+                )
                 .await?;
             return Err(format!("{why} (실패도 근거 기록 {id} 로 남았어요)"));
         };
@@ -1150,7 +1252,11 @@ impl Local {
         if let Some(why) = inside {
             let why = format!("브라우저가 넘어간 주소를 쓸 수 없어요: {why}");
             let id = self
-                .record(ctx, &Rec::fail(ctx, "pc_ego_read", &argv, &at, &why, raw))
+                .record(
+                    ctx,
+                    Rec::fail(ctx, "pc_ego_read", &argv, &at, &why, raw),
+                    None,
+                )
                 .await?;
             return Err(format!("{why} (근거 기록 {id})"));
         }
@@ -1205,9 +1311,12 @@ impl Local {
             run: &ctx.run.id,
             parts,
             binary: None,
+            upload: None,
+            seen: None,
             requery: json!({ "주소": raw, "받은 주소": final_url }),
         };
-        let id = self.record(ctx, &rec).await?;
+        let chars = fail.is_none().then(|| view.chars().count());
+        let id = self.record(ctx, rec, chars).await?;
         if let Some(f) = fail {
             return Err(format!(
                 "{f} — 이 실패도 근거 기록 {id} 로 남았어요(인용하지 마세요)."
@@ -1222,7 +1331,7 @@ impl Local {
                 ("http_status", json!(code)),
             ],
         );
-        lock(&ctx.run.cache).put(id, view);
+        lock(&ctx.run.cache).put(id, ctx.slug, view);
         Ok(p)
     }
 }
@@ -1362,8 +1471,8 @@ mod tests {
     #[test]
     fn cache_drops_oldest_over_limit() {
         let mut c = Cache::default();
-        c.put("a".into(), "x".repeat(CACHE_MAX / 2 + 1));
-        c.put("b".into(), "y".repeat(CACHE_MAX / 2 + 1));
+        c.put("a".into(), "p", "x".repeat(CACHE_MAX / 2 + 1));
+        c.put("b".into(), "p", "y".repeat(CACHE_MAX / 2 + 1));
         assert!(c.get("a").is_none() && c.get("b").is_some());
         assert!(c.bytes <= CACHE_MAX);
     }

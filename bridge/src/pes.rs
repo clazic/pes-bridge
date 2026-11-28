@@ -8,6 +8,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 
@@ -236,8 +237,9 @@ impl Pes {
         Ok(j)
     }
 
-    /// 근거 기록 하나를 올리고 번호를 받는다. 번호를 못 받으면 오류 — 부른 쪽은 그 조회를 실패로 돌려준다
-    pub async fn evidence(&self, rec: &Value) -> Result<String> {
+    /// 근거 기록 하나를 올리고 번호를 받는다. 번호를 못 받으면 오류 — 부른 쪽은 그 조회를 실패로 돌려준다.
+    /// expect_sha: 원본을 나눠 올렸으면(upload) 그 지문 — 서버가 답한 sha256 이 같아야 성공(아니면 오류)
+    pub async fn evidence(&self, rec: &Value, expect_sha: Option<&str>) -> Result<String> {
         let r = serde_json::to_string(rec)?;
         let j = self.signed("/mcp/evidence", "pes-evidence", r).await?;
         let id = j
@@ -247,7 +249,125 @@ impl Pes {
         if !evidence_id_ok(id) {
             bail!("PES 가 준 근거 기록 번호가 꼴에 맞지 않아요: {id}");
         }
+        if let Some(want) = expect_sha {
+            let got = j.get("sha256").and_then(Value::as_str).unwrap_or_default();
+            if !got.eq_ignore_ascii_case(want) {
+                bail!(
+                    "PES 가 받은 원본의 지문이 맞지 않아요(보낸 {want}, 받은 {got}) — 근거 기록 {id} 은 쓰지 않아요"
+                );
+            }
+        }
         Ok(id.to_string())
+    }
+
+    /// 이어 읽기로 AI 에게 더 준 범위를 근거 기록에 더한다(POST /mcp/evidence-seen)
+    pub async fn evidence_seen(
+        &self,
+        slug: &str,
+        id: &str,
+        chars: usize,
+        ranges: &[[usize; 2]],
+    ) -> Result<()> {
+        let r = serde_json::to_string(
+            &json!({ "slug": slug, "evidence_id": id, "chars": chars, "ranges": ranges }),
+        )?;
+        self.signed("/mcp/evidence-seen", "pes-evidence-seen", r)
+            .await
+            .map(|_| ())
+    }
+
+    /// 큰 원본을 바이트 그대로 조각으로 나눠 올린다 — 서버의 큰 파일 올리기(R2 멀티파트, src/uploads.ts)를 브리지 서명으로 쓴 꼴(PES-API.md 5절).
+    /// 돌려주는 것: (파일 번호, sha256). 서버가 이어 붙여 계산한 sha256 이 보낸 것과 다르면 오류
+    pub async fn upload_raw(
+        &self,
+        slug: &str,
+        name: &str,
+        mime: &str,
+        bytes: &[u8],
+    ) -> Result<(String, String)> {
+        let sha = hex::encode(Sha256::digest(bytes));
+        let start = serde_json::to_string(
+            &json!({ "slug": slug, "name": name, "mime": mime, "size": bytes.len(), "sha256": sha }),
+        )?;
+        let j = self
+            .signed("/mcp/evidence-upload", "pes-evidence-upload", start)
+            .await?;
+        let id = j
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("PES 가 올리기 번호를 주지 않았어요"))?
+            .to_string();
+        let part = j
+            .get("part_size")
+            .and_then(Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|n| *n > 0)
+            .ok_or_else(|| anyhow!("PES 가 조각 크기를 주지 않았어요"))?;
+        let key = self.key().await?;
+        for (i, chunk) in bytes.chunks(part).enumerate() {
+            let n = i + 1;
+            let csha = hex::encode(Sha256::digest(chunk));
+            let mut last = None;
+            for _ in 0..2 {
+                // 조각마다 서명 — 연결 토큰만으로는 조각을 바꿔 넣지 못하게
+                let ts = now_ms();
+                let nonce = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 24]>());
+                let sig = self.device.sign(&format!(
+                    "pes-evidence-part\n{ts}\n{nonce}\n{id}\n{n}\n{csha}"
+                ));
+                let resp = self
+                    .http
+                    .put(format!("{}/mcp/evidence-upload/{id}/part/{n}", self.base))
+                    .bearer_auth(&key)
+                    .header("x-pes-ts", ts.to_string())
+                    .header("x-pes-nonce", nonce)
+                    .header("x-pes-sig", sig)
+                    .header("x-pes-part-sha256", &csha)
+                    .header("content-type", "application/octet-stream")
+                    .body(chunk.to_vec()) // 조각 하나만 복사해 보낸다(전체가 아니라)
+                    .send()
+                    .await;
+                match resp {
+                    Ok(r) if r.status().is_success() => {
+                        last = None;
+                        break;
+                    }
+                    Ok(r) => {
+                        let st = r.status();
+                        let e: Value = r.json().await.unwrap_or(Value::Null);
+                        last = Some(
+                            e.get("error")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                                .unwrap_or_else(|| format!("HTTP {st}")),
+                        );
+                    }
+                    Err(e) => last = Some(e.to_string()),
+                }
+            }
+            if let Some(e) = last {
+                bail!("원본 {n}번 조각을 올리지 못했어요: {e}");
+            }
+        }
+        let done = self
+            .signed(
+                &format!("/mcp/evidence-upload/{id}/complete"),
+                "pes-evidence-upload-complete",
+                serde_json::to_string(&json!({ "id": id }))?,
+            )
+            .await?;
+        let file_id = done
+            .get("file_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("PES 가 파일 번호를 주지 않았어요"))?;
+        let got = done
+            .get("sha256")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !got.eq_ignore_ascii_case(&sha) {
+            bail!("PES 가 이어 붙인 원본의 지문이 맞지 않아요(보낸 {sha}, 받은 {got})");
+        }
+        Ok((file_id.to_string(), sha))
     }
 
     /// 작업 로그 한 줄을 올린다(POST /mcp/bridge-log). 실패하면 부른 쪽이 이 컴퓨터의 로그에 남긴다

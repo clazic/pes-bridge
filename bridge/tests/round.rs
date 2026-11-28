@@ -35,7 +35,39 @@ struct Fake {
     beats: Vec<Value>,
     logs: Vec<Value>,
     bad_sig: u32,
+    /// 시험: /mcp/evidence 가 틀린 원본 지문을 답한다
+    bad_sha: bool,
+    /// 나눠 올리기: 올리기 번호 → (프로젝트, 크기, 지문, 조각들)
+    uploads: std::collections::HashMap<String, FakeUpload>,
+    /// 다 올린 파일: 파일 번호 → (지문, 크기, 조각 수)
+    files: std::collections::HashMap<String, (String, usize, usize)>,
+    /// 이어 읽기로 받은 범위
+    seen_posts: Vec<Value>,
 }
+
+/// 가짜 PES 의 조각 크기 — 브리지는 서버가 준 크기를 따른다(실제 R2 는 5MB 이상)
+const FAKE_PART: usize = 512 * 1024;
+
+fn sha_hex(b: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(b))
+}
+
+/// 큰 원본 원문(1MB 넘음) — 나눠 올리기를 시험한다
+fn big_page() -> String {
+    format!(
+        "<html><head><title>큰 원문</title></head><body><p>{}</p><p>큰 원문 끝</p></body></html>",
+        "가나다라 ".repeat(100_000)
+    )
+}
+
+/// 나눠 올리기 하나: (프로젝트, 크기, 지문, 조각 번호 → 바이트)
+type FakeUpload = (
+    String,
+    usize,
+    String,
+    std::collections::BTreeMap<usize, Vec<u8>>,
+);
 
 type St = Arc<Mutex<Fake>>;
 
@@ -173,6 +205,14 @@ async fn plain(State(st): State<St>, uri: axum::http::Uri, h: HeaderMap, body: B
         )
             .into_response();
     }
+    if path == "/big.html" {
+        return (
+            StatusCode::OK,
+            [("content-type", "text/html; charset=utf-8")],
+            big_page(),
+        )
+            .into_response();
+    }
     if path == "/att.pdf" {
         return (
             StatusCode::OK,
@@ -183,6 +223,45 @@ async fn plain(State(st): State<St>, uri: axum::http::Uri, h: HeaderMap, body: B
     }
     if !authed(&h) {
         return jr(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+    // 나눠 올리기 조각(PUT, 바이트 그대로) — 조각마다 서명 확인
+    if let Some(rest) = path.strip_prefix("/mcp/evidence-upload/") {
+        let seg: Vec<&str> = rest.split('/').collect();
+        if let [id, "part", n] = seg.as_slice() {
+            let hv = |k: &str| {
+                h.get(k)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let csha = sha_hex(&body);
+            let msg = format!(
+                "pes-evidence-part\n{}\n{}\n{id}\n{n}\n{csha}",
+                hv("x-pes-ts"),
+                hv("x-pes-nonce")
+            );
+            let mut f = lock(&st);
+            let ok_sig = f
+                .device_pub
+                .as_deref()
+                .is_some_and(|p| verify(p, &msg, &hv("x-pes-sig")))
+                && hv("x-pes-part-sha256") == csha;
+            if !ok_sig {
+                f.bad_sig += 1;
+                return jr(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": "조각 서명이 맞지 않아요" }),
+                );
+            }
+            let Ok(no) = n.parse::<usize>() else {
+                return jr(StatusCode::BAD_REQUEST, json!({ "error": "조각 번호" }));
+            };
+            let Some(up) = f.uploads.get_mut(*id) else {
+                return jr(StatusCode::NOT_FOUND, json!({ "error": "없는 올리기" }));
+            };
+            up.3.insert(no, body.to_vec());
+            return jr(StatusCode::OK, json!({ "n": no, "etag": csha }));
+        }
     }
     let b: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     match path {
@@ -215,6 +294,73 @@ async fn plain(State(st): State<St>, uri: axum::http::Uri, h: HeaderMap, body: B
             lock(&st).device_pub = Some(p.to_string());
             jr(StatusCode::OK, json!({ "ok": true }))
         }
+        "/mcp/evidence-upload" => {
+            let Some(r) = signed(&st, "pes-evidence-upload", &b) else {
+                return jr(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": "서명이 맞지 않아요" }),
+                );
+            };
+            let size = r.get("size").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let sha = r
+                .get("sha256")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let slug = r
+                .get("slug")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let mut f = lock(&st);
+            let id = format!("up{:030}", f.uploads.len() + 1);
+            f.uploads.insert(
+                id.to_string(),
+                (slug, size, sha, std::collections::BTreeMap::new()),
+            );
+            jr(
+                StatusCode::OK,
+                json!({ "id": id, "part_size": FAKE_PART, "parts": size.div_ceil(FAKE_PART) }),
+            )
+        }
+        p if p.starts_with("/mcp/evidence-upload/") && p.ends_with("/complete") => {
+            let Some(r) = signed(&st, "pes-evidence-upload-complete", &b) else {
+                return jr(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": "서명이 맞지 않아요" }),
+                );
+            };
+            let id = r.get("id").and_then(Value::as_str).unwrap_or_default();
+            let mut f = lock(&st);
+            let Some((_, size, sha, parts)) = f.uploads.remove(id) else {
+                return jr(StatusCode::NOT_FOUND, json!({ "error": "없는 올리기" }));
+            };
+            let all: Vec<u8> = parts.values().flatten().copied().collect();
+            let got = sha_hex(&all);
+            if all.len() != size || got != sha {
+                return jr(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": "이어 붙인 크기 · 지문이 맞지 않아요" }),
+                );
+            }
+            let file_id = format!("file{}", f.files.len() + 1);
+            f.files
+                .insert(file_id.to_string(), (got.to_string(), size, parts.len()));
+            jr(
+                StatusCode::OK,
+                json!({ "file_id": file_id, "size": size, "sha256": got }),
+            )
+        }
+        "/mcp/evidence-seen" => {
+            let Some(r) = signed(&st, "pes-evidence-seen", &b) else {
+                return jr(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": "서명이 맞지 않아요" }),
+                );
+            };
+            lock(&st).seen_posts.push(r);
+            jr(StatusCode::OK, json!({ "ok": true }))
+        }
         "/mcp/evidence" => {
             if lock(&st).evidence_fail {
                 return jr(
@@ -235,9 +381,33 @@ async fn plain(State(st): State<St>, uri: axum::http::Uri, h: HeaderMap, body: B
                 );
             }
             let mut f = lock(&st);
+            // 나눠 올린 원본: 그 파일이 있고 지문이 같아야 받는다
+            let mut sha = Value::Null;
+            if let Some(up) = rec.get("upload") {
+                let fid = up
+                    .get("file_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let want = up.get("sha256").and_then(Value::as_str).unwrap_or_default();
+                match f.files.get(fid) {
+                    Some((s, _, _)) if s == want => {
+                        sha = json!(if f.bad_sha {
+                            "0".repeat(64)
+                        } else {
+                            s.to_string()
+                        })
+                    }
+                    _ => {
+                        return jr(
+                            StatusCode::BAD_REQUEST,
+                            json!({ "error": "올린 파일이 없거나 지문이 달라요" }),
+                        );
+                    }
+                }
+            }
             let id = ev_id(f.evidence.len() + 1);
             f.evidence.push(json!({ "id": id, "rec": rec }));
-            jr(StatusCode::OK, json!({ "evidence_id": id }))
+            jr(StatusCode::OK, json!({ "evidence_id": id, "sha256": sha }))
         }
         "/mcp/bridge-log" => {
             let Some(mut r) = signed(&st, "pes-bridge-log", &b) else {
@@ -285,10 +455,11 @@ struct Env {
     log: PathBuf,
 }
 
-async fn fake_pes(engine: &str, evidence_fail: bool) -> R<Env> {
+async fn fake_pes(engine: &str, evidence_fail: bool, bad_sha: bool) -> R<Env> {
     let st: St = Arc::new(Mutex::new(Fake {
         engine: engine.to_string(),
         evidence_fail,
+        bad_sha,
         ..Fake::default()
     }));
     let app = Router::new()
@@ -408,7 +579,7 @@ fn has_log(f: &Fake, action: &str) -> bool {
 
 /// 일을 받아 라운드 한 바퀴 — 엔진마다
 async fn full_round(engine: &str) -> R<()> {
-    let e = fake_pes(engine, false).await?;
+    let e = fake_pes(engine, false, false).await?;
     let mut child = spawn_bridge(&e, engine, false, false)?;
     let ok = wait_for(&e.st, 60, |f| {
         !f.submits.is_empty() && has_log(f, "bridge_round_end")
@@ -705,13 +876,90 @@ async fn full_round(engine: &str) -> R<()> {
         "/mcp/bridge-log",
         "/page.html",
         "/att.pdf",
+        "/big.html",
+        "/mcp/evidence-upload",
+        "/mcp/evidence-seen",
     ];
     for p in &f.paths {
         assert!(
-            p.starts_with("mcp:") || allowed.contains(&p.as_str()),
+            p.starts_with("mcp:")
+                || p.starts_with("/mcp/evidence-upload/")
+                || allowed.contains(&p.as_str()),
             "예상 밖 요청: {p}"
         );
     }
+    // 본 범위: 근거와 함께 첫 쪽, 이어 읽을 때마다 evidence-seen
+    let pid = res
+        .get("page_id")
+        .and_then(Value::as_str)
+        .ok_or("page_id")?;
+    let total = res
+        .get("page_total")
+        .and_then(Value::as_u64)
+        .ok_or("page_total")?;
+    let prec = f
+        .evidence
+        .iter()
+        .find(|x| x.get("id").and_then(Value::as_str) == Some(pid))
+        .ok_or("page 근거 기록")?;
+    assert_eq!(
+        prec.pointer("/rec/seen"),
+        Some(&json!({ "chars": total, "ranges": [[0, 40_000]], "pages": 1 })),
+        "첫 쪽 범위를 근거와 함께 보내요"
+    );
+    let more: Vec<&Value> = f
+        .seen_posts
+        .iter()
+        .filter(|s| s.get("evidence_id").and_then(Value::as_str) == Some(pid))
+        .collect();
+    assert!(!more.is_empty(), "이어 읽기 범위를 보내요");
+    assert_eq!(
+        more[0].get("ranges"),
+        Some(&json!([[40_000, total.min(80_000)]]))
+    );
+    assert_eq!(more[0].get("slug"), Some(&json!(SLUG)));
+    // 큰 원본(1MB 넘음): 바이트 그대로 조각으로 나눠 올리고, 근거는 파일 번호 + 지문
+    assert_eq!(
+        res.pointer("/big/isError"),
+        Some(&json!(false)),
+        "{:?}",
+        res.get("big")
+    );
+    let bid = res
+        .pointer("/big/data/evidence_id")
+        .and_then(Value::as_str)
+        .ok_or("big evidence_id")?;
+    let brec = f
+        .evidence
+        .iter()
+        .find(|x| x.get("id").and_then(Value::as_str) == Some(bid))
+        .ok_or("큰 원본 근거 기록")?;
+    let sha = sha_hex(big_page().as_bytes());
+    assert_eq!(brec.pointer("/rec/upload/sha256"), Some(&json!(sha)));
+    assert_eq!(
+        brec.pointer("/rec/upload/size"),
+        Some(&json!(big_page().len()))
+    );
+    assert_eq!(
+        brec.pointer("/rec/parts"),
+        Some(&json!([])),
+        "본문은 따로 올린 파일에만"
+    );
+    let fid = brec
+        .pointer("/rec/upload/file_id")
+        .and_then(Value::as_str)
+        .ok_or("file_id")?;
+    assert!(
+        f.files.get(fid).is_some_and(|x| x.2 >= 2),
+        "여러 조각으로 올려요"
+    );
+    assert!(
+        res.get("big_tail")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("큰 원문 끝"),
+        "AI 는 끝까지 읽어요"
+    );
     assert!(
         !f.paths
             .iter()
@@ -738,7 +986,7 @@ async fn round_opencode() -> R<()> {
 /// 근거 기록을 못 올리면 그 도구 호출은 실패 — AI 는 결과를 받지 못한다
 #[tokio::test(flavor = "multi_thread")]
 async fn evidence_upload_failure_fails_the_tool() -> R<()> {
-    let e = fake_pes("claude-code", true).await?;
+    let e = fake_pes("claude-code", true, false).await?;
     let mut child = spawn_bridge(&e, "claude-code", false, true)?;
     let ok = wait_for(&e.st, 60, |f| {
         !f.submits.is_empty() && has_log(f, "bridge_round_end")
@@ -803,7 +1051,7 @@ async fn evidence_upload_failure_fails_the_tool() -> R<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn old_ai_is_refused() -> R<()> {
     for engine in ["claude-code", "codex", "opencode"] {
-        let e = fake_pes(engine, false).await?;
+        let e = fake_pes(engine, false, false).await?;
         let mut child = spawn_bridge(&e, engine, true, false)?;
         let ok = wait_for(&e.st, 30, |f| has_log(f, "bridge_round_refused")).await;
         let _ = child.kill().await;
@@ -836,5 +1084,35 @@ async fn old_ai_is_refused() -> R<()> {
             .ok_or("refused")?;
         assert_eq!(r.get("result"), Some(&json!("denied")));
     }
+    Ok(())
+}
+
+/// 나눠 올린 원본의 지문이 서버 답과 다르면 그 도구 호출은 실패
+#[tokio::test(flavor = "multi_thread")]
+async fn upload_sha_mismatch_fails_the_tool() -> R<()> {
+    let e = fake_pes("claude-code", false, true).await?;
+    let mut child = spawn_bridge(&e, "claude-code", false, false)?;
+    let ok = wait_for(&e.st, 60, |f| {
+        !f.submits.is_empty() && has_log(f, "bridge_round_end")
+    })
+    .await;
+    let _ = child.kill().await;
+    assert!(ok, "라운드가 끝나지 않았어요");
+    let log = ai_log(&e.log);
+    let res = step(&log, "results").ok_or("가짜 AI 결과가 없어요")?;
+    assert_eq!(res.pointer("/big/isError"), Some(&json!(true)));
+    let text = res
+        .pointer("/big/text")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        text.contains("지문이 맞지 않아요") && !text.contains("가나다라"),
+        "{text}"
+    );
+    assert_eq!(
+        res.pointer("/kosis/isError"),
+        Some(&json!(false)),
+        "작은 원본은 그대로 된다"
+    );
     Ok(())
 }
